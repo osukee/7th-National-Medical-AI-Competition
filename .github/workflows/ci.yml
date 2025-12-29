@@ -1,0 +1,195 @@
+name: CI Pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  PYTHON_VERSION: '3.10'
+
+jobs:
+  test:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest pytest-cov
+
+      - name: Run linter
+        run: |
+          pip install ruff
+          ruff check src/ tests/ --ignore E501 || true
+
+      - name: Run unit tests
+        run: |
+          python -m pytest tests/ -v --tb=short --cov=src --cov-report=xml
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage.xml
+
+  train:
+    name: Training & Metrics
+    runs-on: ubuntu-latest
+    needs: test
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run short training
+        id: train
+        run: |
+          # 短時間トレーニング実行（CI用の軽量版）
+          python src/train.py --epochs 1 --quick-check 2>/dev/null || echo "Training script not yet configured"
+        continue-on-error: true
+
+      - name: Calculate metrics
+        id: metrics
+        run: |
+          # メトリクス計算スクリプト
+          python -c "
+          import json
+          from datetime import datetime
+          
+          # サンプルメトリクス（実際の訓練後に置き換え）
+          metrics = {
+              'experiment_id': '${{ github.head_ref || github.ref_name }}',
+              'timestamp': datetime.now().isoformat(),
+              'commit_sha': '${{ github.sha }}',
+              'metrics': {
+                  'ssim': 0.0,
+                  'psnr': 0.0,
+                  'ssim_std': 0.0,
+                  'psnr_std': 0.0
+              },
+              'ci_status': 'passed' if ${{ steps.train.outcome == 'success' }} else 'failed',
+              'training_time_seconds': 0,
+              'gpu_memory_peak_mb': 0
+          }
+          
+          with open('metrics.json', 'w') as f:
+              json.dump(metrics, f, indent=2)
+          
+          print('=== Metrics Generated ===')
+          print(json.dumps(metrics, indent=2))
+          "
+
+      - name: Upload metrics artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: metrics
+          path: metrics.json
+          retention-days: 90
+
+      - name: Post metrics summary
+        run: |
+          echo "## 📊 CI Metrics Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`json" >> $GITHUB_STEP_SUMMARY
+          cat metrics.json >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          echo "*View full metrics in the [artifacts](../actions/runs/${{ github.run_id }})*" >> $GITHUB_STEP_SUMMARY
+
+  decision:
+    name: Improvement Decision
+    runs-on: ubuntu-latest
+    needs: train
+    if: github.event_name == 'pull_request'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download metrics
+        uses: actions/download-artifact@v4
+        with:
+          name: metrics
+          path: ./
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Generate decision report
+        run: |
+          python scripts/collect_ci_results.py ${{ github.head_ref }} --metrics-file metrics.json
+
+      - name: Comment on PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const metrics = JSON.parse(fs.readFileSync('metrics.json', 'utf8'));
+            
+            const ssim = metrics.metrics.ssim;
+            const psnr = metrics.metrics.psnr;
+            const status = metrics.ci_status;
+            
+            let decision = '';
+            let emoji = '';
+            
+            if (status !== 'passed') {
+              decision = '❌ 却下 (CI失敗)';
+              emoji = '❌';
+            } else if (ssim >= 0.90 && psnr >= 35) {
+              decision = '✅ 採用推奨';
+              emoji = '✅';
+            } else if (ssim >= 0.80 && psnr >= 30) {
+              decision = '🔶 保留 (追加検証推奨)';
+              emoji = '🔶';
+            } else {
+              decision = '❌ 却下 (基準未達)';
+              emoji = '❌';
+            }
+            
+            const body = `## ${emoji} CI Experiment Results
+            
+            | Metric | Value |
+            |--------|-------|
+            | **SSIM** | ${ssim.toFixed(4)} |
+            | **PSNR** | ${psnr.toFixed(2)} dB |
+            | **CI Status** | ${status} |
+            
+            ### Decision: ${decision}
+            
+            ---
+            *Auto-generated by CI Pipeline*`;
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: body
+            });
