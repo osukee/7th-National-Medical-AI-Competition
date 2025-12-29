@@ -1,0 +1,20 @@
+services:
+  train:
+    build: .
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+    volumes:
+      - ./medical-ai-contest-7th-2025:/app/medical-ai-contest-7th-2025:ro
+      - ./outputs:/app/outputs
+    command: python src/train.py --epochs 50 --batch-size 8 --image-size 512
+
+  train-quick:
+    build: .
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+    volumes:
+      - ./medical-ai-contest-7th-2025:/app/medical-ai-contest-7th-2025:ro
+      - ./outputs:/app/outputs
+    command: python src/train.py --quick-check --batch-size 4 --image-size 256
