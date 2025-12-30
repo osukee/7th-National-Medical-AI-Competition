@@ -1,0 +1,14 @@
+{
+    "id": "osukea/medical-ai-training",
+    "title": "Medical AI Virtual Staining Training",
+    "code_file": "train_notebook.py",
+    "language": "python",
+    "kernel_type": "script",
+    "is_private": true,
+    "enable_gpu": true,
+    "enable_internet": true,
+    "competition_sources": [
+        "medical-ai-contest-7th-2025"
+    ],
+    "dataset_sources": []
+}

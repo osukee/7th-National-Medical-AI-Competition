@@ -118,6 +118,38 @@ graph LR
 
 ---
 
+## 🎮 Kaggle GPU訓練
+
+GPUが必要な訓練はKaggleで実行できます。
+
+### セットアップ
+
+1. **Kaggle APIトークンを取得**
+   - [Kaggle Settings](https://www.kaggle.com/settings/account) → API → "Create New Token"
+   - `kaggle.json`がダウンロードされる
+
+2. **GitHub Secretsに登録**
+   - Repository → Settings → Secrets and variables → Actions
+   - `KAGGLE_USERNAME`: Kaggleユーザー名
+   - `KAGGLE_KEY`: APIキー
+
+### 使い方
+
+**手動実行（GitHub Actions）:**
+1. Actions → "Train on Kaggle" → "Run workflow"
+2. パラメータを設定して実行
+3. 完了後、metricsがPRにコメントされる
+
+**自動実行:**
+- `experiment/**`ブランチにpushすると自動で訓練開始
+
+**ローカルから実行:**
+```bash
+python scripts/trigger_kaggle_training.py --username YOUR_USERNAME
+```
+
+---
+
 ## 🛠️ スクリプト
 
 | スクリプト | 用途 |
@@ -126,6 +158,7 @@ graph LR
 | `scripts/remove_worktree.sh` | Worktree削除 |
 | `scripts/run_tests_local.sh` | ローカルテスト実行 |
 | `scripts/collect_ci_results.py` | CI結果収集・レポート生成 |
+| `scripts/trigger_kaggle_training.py` | Kaggle訓練トリガー |
 
 ---
 

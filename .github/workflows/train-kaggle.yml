@@ -1,0 +1,184 @@
+name: Train on Kaggle
+
+on:
+  workflow_dispatch:
+    inputs:
+      epochs:
+        description: 'Number of training epochs'
+        required: false
+        default: '50'
+      batch_size:
+        description: 'Batch size'
+        required: false
+        default: '8'
+      experiment_id:
+        description: 'Experiment ID for tracking'
+        required: false
+        default: 'manual_run'
+  push:
+    branches:
+      - 'experiment/**'
+
+env:
+  PYTHON_VERSION: '3.10'
+
+jobs:
+  trigger-kaggle:
+    name: Trigger Kaggle Training
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install Kaggle CLI
+        run: |
+          pip install kaggle
+          mkdir -p ~/.kaggle
+          echo '{"username":"${{ secrets.KAGGLE_USERNAME }}","key":"${{ secrets.KAGGLE_KEY }}"}' > ~/.kaggle/kaggle.json
+          chmod 600 ~/.kaggle/kaggle.json
+
+      - name: Prepare kernel metadata
+        run: |
+          # Update kernel-metadata.json with actual username
+          cd kaggle
+          sed -i "s/INSERT_USERNAME/${{ secrets.KAGGLE_USERNAME }}/g" kernel-metadata.json
+          
+          # Show prepared metadata
+          echo "=== Kernel Metadata ==="
+          cat kernel-metadata.json
+
+      - name: Push kernel to Kaggle
+        id: push_kernel
+        run: |
+          cd kaggle
+          
+          # Set environment variables for the kernel
+          export EXPERIMENT_ID="${{ github.event.inputs.experiment_id || github.ref_name }}"
+          export COMMIT_SHA="${{ github.sha }}"
+          export BRANCH_NAME="${{ github.ref_name }}"
+          export EPOCHS="${{ github.event.inputs.epochs || '50' }}"
+          export BATCH_SIZE="${{ github.event.inputs.batch_size || '8' }}"
+          
+          echo "Pushing kernel to Kaggle..."
+          kaggle kernels push
+          
+          echo "kernel_id=${{ secrets.KAGGLE_USERNAME }}/medical-ai-training" >> $GITHUB_OUTPUT
+
+      - name: Wait for kernel completion
+        id: wait_kernel
+        run: |
+          KERNEL_ID="${{ steps.push_kernel.outputs.kernel_id }}"
+          echo "Waiting for kernel: $KERNEL_ID"
+          
+          MAX_WAIT=21600  # 6 hours in seconds
+          POLL_INTERVAL=300  # 5 minutes
+          ELAPSED=0
+          
+          while [ $ELAPSED -lt $MAX_WAIT ]; do
+            STATUS=$(kaggle kernels status "$KERNEL_ID" 2>/dev/null | grep -oP 'status "\K[^"]+' || echo "unknown")
+            echo "Status: $STATUS (elapsed: ${ELAPSED}s)"
+            
+            if [ "$STATUS" = "complete" ]; then
+              echo "Kernel completed successfully!"
+              echo "status=complete" >> $GITHUB_OUTPUT
+              exit 0
+            elif [ "$STATUS" = "error" ] || [ "$STATUS" = "cancelAcknowledged" ]; then
+              echo "Kernel failed with status: $STATUS"
+              echo "status=failed" >> $GITHUB_OUTPUT
+              exit 1
+            fi
+            
+            sleep $POLL_INTERVAL
+            ELAPSED=$((ELAPSED + POLL_INTERVAL))
+          done
+          
+          echo "Timeout waiting for kernel"
+          echo "status=timeout" >> $GITHUB_OUTPUT
+          exit 1
+
+      - name: Download kernel output
+        if: steps.wait_kernel.outputs.status == 'complete'
+        run: |
+          KERNEL_ID="${{ steps.push_kernel.outputs.kernel_id }}"
+          mkdir -p output
+          kaggle kernels output "$KERNEL_ID" -p output/
+          
+          echo "=== Downloaded Files ==="
+          ls -la output/
+          
+          if [ -f output/metrics.json ]; then
+            echo "=== Metrics ==="
+            cat output/metrics.json
+          fi
+
+      - name: Upload metrics artifact
+        if: steps.wait_kernel.outputs.status == 'complete'
+        uses: actions/upload-artifact@v4
+        with:
+          name: kaggle-training-results
+          path: output/
+          retention-days: 90
+
+      - name: Post summary
+        if: always()
+        run: |
+          echo "## 🚀 Kaggle Training Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Status**: ${{ steps.wait_kernel.outputs.status || 'pending' }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ -f output/metrics.json ]; then
+            echo "### Metrics" >> $GITHUB_STEP_SUMMARY
+            echo '```json' >> $GITHUB_STEP_SUMMARY
+            cat output/metrics.json >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Comment on PR
+        if: github.event_name == 'pull_request' && steps.wait_kernel.outputs.status == 'complete'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            let metrics = {};
+            
+            try {
+              metrics = JSON.parse(fs.readFileSync('output/metrics.json', 'utf8'));
+            } catch (e) {
+              console.log('Could not read metrics.json');
+              return;
+            }
+            
+            const body = `## 🎉 Kaggle Training Complete
+
+            **Experiment**: ${metrics.experiment_id}
+            **Training Time**: ${Math.round(metrics.training_time_seconds / 60)} minutes
+
+            ### Results
+            | Metric | Value |
+            |--------|-------|
+            | **SSIM** | ${metrics.metrics.ssim.toFixed(4)} |
+            | **PSNR** | ${metrics.metrics.psnr.toFixed(2)} dB |
+            | **SSIM Std** | ±${metrics.metrics.ssim_std.toFixed(4)} |
+            | **PSNR Std** | ±${metrics.metrics.psnr_std.toFixed(2)} dB |
+
+            ### Configuration
+            - Epochs: ${metrics.config.epochs}
+            - Batch Size: ${metrics.config.batch_size}
+            - Learning Rate: ${metrics.config.learning_rate}
+
+            ---
+            *Trained on Kaggle GPU*`;
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: body
+            });
