@@ -68,7 +68,7 @@ jobs:
           echo "Pushing kernel to Kaggle..."
           kaggle kernels push
           
-          echo "kernel_id=${{ secrets.KAGGLE_USERNAME }}/medical-ai-training" >> $GITHUB_OUTPUT
+          echo "kernel_id=${{ secrets.KAGGLE_USERNAME }}/medical-ai-virtual-staining-training" >> $GITHUB_OUTPUT
 
       - name: Wait for kernel completion
         id: wait_kernel

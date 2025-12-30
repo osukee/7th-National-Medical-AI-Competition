@@ -1,5 +1,5 @@
 {
-    "id": "osukea/medical-ai-training",
+    "id": "osukea/medical-ai-virtual-staining-training",
     "title": "Medical AI Virtual Staining Training",
     "code_file": "train_notebook.py",
     "language": "python",
