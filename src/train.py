@@ -19,6 +19,8 @@ from skimage.metrics import structural_similarity as ssim
 from skimage.metrics import peak_signal_noise_ratio as psnr
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
+import torchvision.models as models
+
 
 # Try to import segmentation_models_pytorch, fallback to simple U-Net if not available
 try:
@@ -54,6 +56,7 @@ class Config:
     # Loss weights
     l1_weight = 1.0
     ssim_weight = 1.0
+    perceptual_weight = 0.1  # VGG19 perceptual loss weight
     
     # Model
     encoder = "resnet34"
@@ -244,18 +247,71 @@ class SSIMLoss(nn.Module):
             return 1 - ssim_map.mean(1).mean(1).mean(1)
 
 
+class PerceptualLoss(nn.Module):
+    """VGG19-based perceptual loss for structure preservation."""
+    
+    def __init__(self, layer_indices=[4, 9, 18]):
+        super().__init__()
+        vgg = models.vgg19(weights=models.VGG19_Weights.IMAGENET1K_V1).features
+        self.layers = nn.ModuleList()
+        
+        prev_idx = 0
+        for idx in layer_indices:
+            self.layers.append(nn.Sequential(*list(vgg.children())[prev_idx:idx]))
+            prev_idx = idx
+        
+        # Freeze VGG weights
+        for param in self.parameters():
+            param.requires_grad = False
+        
+        # ImageNet normalization
+        self.register_buffer('mean', torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
+        self.register_buffer('std', torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
+    
+    def forward(self, pred, target):
+        # Convert grayscale to RGB (repeat channels)
+        pred_rgb = pred.repeat(1, 3, 1, 1)
+        target_rgb = target.repeat(1, 3, 1, 1)
+        
+        # Normalize
+        pred_rgb = (pred_rgb - self.mean) / self.std
+        target_rgb = (target_rgb - self.mean) / self.std
+        
+        loss = 0.0
+        x_pred, x_target = pred_rgb, target_rgb
+        
+        for layer in self.layers:
+            x_pred = layer(x_pred)
+            x_target = layer(x_target)
+            loss += nn.functional.mse_loss(x_pred, x_target)
+        
+        return loss
+
+
 class CombinedLoss(nn.Module):
-    def __init__(self, l1_weight=1.0, ssim_weight=1.0):
+    def __init__(self, l1_weight=1.0, ssim_weight=1.0, perceptual_weight=0.0):
         super().__init__()
         self.l1_loss = nn.L1Loss()
         self.ssim_loss = SSIMLoss()
         self.l1_weight = l1_weight
         self.ssim_weight = ssim_weight
+        self.perceptual_weight = perceptual_weight
+        
+        if perceptual_weight > 0:
+            self.perceptual_loss = PerceptualLoss()
+        else:
+            self.perceptual_loss = None
     
     def forward(self, pred, target):
         l1 = self.l1_loss(pred, target)
         ssim = self.ssim_loss(pred, target)
-        return self.l1_weight * l1 + self.ssim_weight * ssim
+        total = self.l1_weight * l1 + self.ssim_weight * ssim
+        
+        if self.perceptual_loss is not None:
+            perceptual = self.perceptual_loss(pred, target)
+            total += self.perceptual_weight * perceptual
+        
+        return total
 
 
 # ==============================================================================
@@ -407,7 +463,7 @@ def train(config):
     print(f"Device: {config.device}")
     
     # Loss and optimizer
-    criterion = CombinedLoss(config.l1_weight, config.ssim_weight)
+    criterion = CombinedLoss(config.l1_weight, config.ssim_weight, config.perceptual_weight)
     optimizer = optim.AdamW(
         model.parameters(),
         lr=config.learning_rate,
