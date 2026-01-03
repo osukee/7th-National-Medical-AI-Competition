@@ -393,7 +393,7 @@ def train(config):
     
     # Model
     if USE_SMP:
-        model = smp.Unet(
+        model = smp.MAnet(  # Changed from Unet to MAnet (Multi-scale Attention)
             encoder_name=config.encoder,
             encoder_weights=config.encoder_weights,
             in_channels=config.in_channels,
@@ -403,7 +403,7 @@ def train(config):
         model = SimpleUNet(config.in_channels, config.out_channels)
     
     model = model.to(config.device)
-    print(f"Model: {'SMP U-Net' if USE_SMP else 'Simple U-Net'}")
+    print(f"Model: {'SMP MAnet' if USE_SMP else 'Simple U-Net'}")
     print(f"Device: {config.device}")
     
     # Loss and optimizer
