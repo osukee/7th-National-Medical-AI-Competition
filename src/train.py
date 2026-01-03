@@ -28,6 +28,14 @@ except ImportError:
     USE_SMP = False
     print("Warning: segmentation_models_pytorch not found. Using simple U-Net.")
 
+# Try to import albumentations for data augmentation
+try:
+    import albumentations as A
+    USE_AUGMENTATION = True
+except ImportError:
+    USE_AUGMENTATION = False
+    print("Warning: albumentations not found. Augmentation disabled.")
+
 
 # ==============================================================================
 # Configuration
@@ -67,6 +75,9 @@ class Config:
     
     # Seed
     seed = 42
+    
+    # Augmentation
+    use_augmentation = True  # Enable/disable data augmentation
 
 
 # ==============================================================================
@@ -74,11 +85,28 @@ class Config:
 # ==============================================================================
 
 class OrganoidDataset(Dataset):
-    def __init__(self, csv_path, data_dir, image_size=512, is_test=False):
+    def __init__(self, csv_path, data_dir, image_size=512, is_test=False, use_augmentation=False):
         self.df = pd.read_csv(csv_path)
         self.data_dir = Path(data_dir)
         self.image_size = image_size
         self.is_test = is_test
+        self.use_augmentation = use_augmentation and USE_AUGMENTATION and not is_test
+        
+        # Define augmentation pipeline
+        if self.use_augmentation:
+            self.transform = A.Compose([
+                A.HorizontalFlip(p=0.5),
+                A.VerticalFlip(p=0.5),
+                A.Rotate(limit=15, p=0.5, border_mode=0),
+                A.RandomBrightnessContrast(
+                    brightness_limit=0.1,
+                    contrast_limit=0.1,
+                    p=0.5
+                ),
+                A.ElasticTransform(alpha=50, sigma=5, p=0.3),
+            ], additional_targets={'target': 'image', 'mask': 'mask'})
+        else:
+            self.transform = None
         
     def __len__(self):
         return len(self.df)
@@ -91,9 +119,9 @@ class OrganoidDataset(Dataset):
         input_img = Image.open(input_path).convert("L")
         input_img = input_img.resize((self.image_size, self.image_size), Image.BILINEAR)
         input_arr = np.array(input_img, dtype=np.float32) / 255.0
-        input_tensor = torch.from_numpy(input_arr).unsqueeze(0)  # (1, H, W)
         
         if self.is_test:
+            input_tensor = torch.from_numpy(input_arr).unsqueeze(0)  # (1, H, W)
             return {
                 "id": row["id"],
                 "input": input_tensor,
@@ -104,13 +132,22 @@ class OrganoidDataset(Dataset):
         target_img = Image.open(target_path).convert("L")
         target_img = target_img.resize((self.image_size, self.image_size), Image.BILINEAR)
         target_arr = np.array(target_img, dtype=np.float32) / 255.0
-        target_tensor = torch.from_numpy(target_arr).unsqueeze(0)  # (1, H, W)
         
         # Load mask (optional, for weighted loss)
         mask_path = self.data_dir / row["mask_path"]
         mask_img = Image.open(mask_path).convert("L")
         mask_img = mask_img.resize((self.image_size, self.image_size), Image.NEAREST)
         mask_arr = np.array(mask_img, dtype=np.float32) / 255.0
+        
+        # Apply augmentation if enabled
+        if self.transform is not None:
+            augmented = self.transform(image=input_arr, target=target_arr, mask=mask_arr)
+            input_arr = augmented['image']
+            target_arr = augmented['target']
+            mask_arr = augmented['mask']
+        
+        input_tensor = torch.from_numpy(input_arr).unsqueeze(0)  # (1, H, W)
+        target_tensor = torch.from_numpy(target_arr).unsqueeze(0)  # (1, H, W)
         mask_tensor = torch.from_numpy(mask_arr).unsqueeze(0)  # (1, H, W)
         
         return {
@@ -355,23 +392,38 @@ def train(config):
     # Create output directory
     config.output_dir.mkdir(parents=True, exist_ok=True)
     
-    # Dataset
-    full_dataset = OrganoidDataset(
+    # Dataset with augmentation for training
+    train_full_dataset = OrganoidDataset(
         config.train_csv,
         config.data_dir,
         config.image_size,
-        is_test=False
+        is_test=False,
+        use_augmentation=config.use_augmentation
     )
     
-    # Train/Val split
-    n_samples = len(full_dataset)
+    # Dataset without augmentation for validation
+    val_full_dataset = OrganoidDataset(
+        config.train_csv,
+        config.data_dir,
+        config.image_size,
+        is_test=False,
+        use_augmentation=False
+    )
+    
+    # Train/Val split (same indices for both datasets)
+    n_samples = len(train_full_dataset)
     n_train = int(n_samples * 0.8)
     n_val = n_samples - n_train
     
-    train_dataset, val_dataset = torch.utils.data.random_split(
-        full_dataset, [n_train, n_val],
-        generator=torch.Generator().manual_seed(config.seed)
-    )
+    # Generate indices
+    generator = torch.Generator().manual_seed(config.seed)
+    indices = torch.randperm(n_samples, generator=generator).tolist()
+    train_indices = indices[:n_train]
+    val_indices = indices[n_train:]
+    
+    train_dataset = torch.utils.data.Subset(train_full_dataset, train_indices)
+    val_dataset = torch.utils.data.Subset(val_full_dataset, val_indices)
+
     
     train_loader = DataLoader(
         train_dataset,
