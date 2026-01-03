@@ -36,14 +36,15 @@ jobs:
 
       - name: Run unit tests
         run: |
-          python -m pytest tests/ -v --tb=short
+          python -m pytest tests/ -v --tb=short --junitxml=test-results.xml
 
       - name: Upload test results
         uses: actions/upload-artifact@v4
         if: always()
         with:
           name: test-results
-          path: .pytest_cache/
+          path: test-results.xml
+          if-no-files-found: warn
 
   train:
     name: Baseline Training
@@ -72,47 +73,27 @@ jobs:
         id: check_data
         run: |
           if [ -d "medical-ai-contest-7th-2025/train" ] && [ "$(ls -A medical-ai-contest-7th-2025/train 2>/dev/null | head -1)" ]; then
-            echo "data_exists=true" >> $GITHUB_OUTPUT
+            echo "data_dir=medical-ai-contest-7th-2025" >> $GITHUB_OUTPUT
             echo "✅ Training data found"
           else
-            echo "data_exists=false" >> $GITHUB_OUTPUT
-            echo "⚠️ Training data not found - generating placeholder metrics"
+            echo "data_dir=sample-data" >> $GITHUB_OUTPUT
+            echo "⚠️ Training data not found - generating sample data"
+            python scripts/create_sample_data.py --output-dir sample-data --num-samples 10
           fi
 
       - name: Run training (quick check)
-        if: steps.check_data.outputs.data_exists == 'true'
         run: |
-          python src/train.py --quick-check --batch-size 2 --image-size 256
+          python src/train.py --quick-check --batch-size 2 --image-size 256 --data-dir ${{ steps.check_data.outputs.data_dir }}
         timeout-minutes: 30
 
-      - name: Generate placeholder metrics
-        if: steps.check_data.outputs.data_exists != 'true'
+      - name: Save training metrics
         run: |
-          python -c "
-          import json
-          from datetime import datetime
-          
-          metrics = {
-              'experiment_id': '${{ github.head_ref || github.ref_name }}',
-              'timestamp': datetime.now().isoformat(),
-              'commit_sha': '${{ github.sha }}',
-              'metrics': {
-                  'ssim': 0.0,
-                  'psnr': 0.0,
-                  'ssim_std': 0.0,
-                  'psnr_std': 0.0
-              },
-              'ci_status': 'passed',
-              'training_time_seconds': 0,
-              'note': 'Placeholder - training data not available in CI'
-          }
-          
-          with open('metrics.json', 'w') as f:
-              json.dump(metrics, f, indent=2)
-          
-          print('=== Metrics Generated ===')
-          print(json.dumps(metrics, indent=2))
-          "
+          if [ -f "metrics.json" ]; then
+            echo "✅ Training completed - metrics.json generated"
+            cat metrics.json
+          else
+            echo "⚠️ No metrics.json found"
+          fi
 
       - name: Upload metrics artifact
         uses: actions/upload-artifact@v4
