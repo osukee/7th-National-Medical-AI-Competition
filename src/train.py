@@ -493,6 +493,7 @@ def main():
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--image-size", type=int, default=512)
+    parser.add_argument("--data-dir", type=str, default="medical-ai-contest-7th-2025")
     parser.add_argument("--quick-check", action="store_true")
     args = parser.parse_args()
     
@@ -501,6 +502,9 @@ def main():
     config.batch_size = args.batch_size
     config.learning_rate = args.lr
     config.image_size = args.image_size
+    config.data_dir = Path(args.data_dir)
+    config.train_csv = config.data_dir / "train.csv"
+    config.test_csv = config.data_dir / "test.csv"
     
     if args.quick_check:
         quick_check(config)
