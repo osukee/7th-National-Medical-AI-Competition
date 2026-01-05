@@ -45,7 +45,7 @@ class Config:
     
     # Loss weights
     l1_weight = 1.0
-    ssim_weight = 1.0
+    ssim_weight = 2.0  # exp_006: 1.0→2.0に増加
     
     # Model
     encoder = "resnet34"
