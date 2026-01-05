@@ -6,7 +6,7 @@ on:
       epochs:
         description: 'Number of training epochs'
         required: false
-        default: '50'
+        default: '3'  # Reduced for baseline (increase after validation)
       batch_size:
         description: 'Batch size'
         required: false
@@ -62,7 +62,7 @@ jobs:
           export EXPERIMENT_ID="${{ github.event.inputs.experiment_id || github.ref_name }}"
           export COMMIT_SHA="${{ github.sha }}"
           export BRANCH_NAME="${{ github.ref_name }}"
-          export EPOCHS="${{ github.event.inputs.epochs || '50' }}"
+          export EPOCHS="${{ github.event.inputs.epochs || '3' }}"
           export BATCH_SIZE="${{ github.event.inputs.batch_size || '8' }}"
           
           echo "Pushing kernel to Kaggle..."

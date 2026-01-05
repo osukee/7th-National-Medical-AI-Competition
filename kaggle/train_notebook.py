@@ -37,7 +37,7 @@ class Config:
     out_channels = 1
     
     # Training
-    epochs = 10  # 50→10: タイムアウト回避のため削減（仮説検証）
+    epochs = 3  # 50→3: ベースライン動作確認用（通過後に増やす）
     batch_size = 8
     learning_rate = 1e-4
     weight_decay = 1e-5

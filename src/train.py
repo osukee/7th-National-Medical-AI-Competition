@@ -45,7 +45,7 @@ class Config:
     out_channels = 1
     
     # Training
-    epochs = 50
+    epochs = 3  # ベースライン動作確認用（通過後に増やす）
     batch_size = 4
     learning_rate = 1e-4
     weight_decay = 1e-5
