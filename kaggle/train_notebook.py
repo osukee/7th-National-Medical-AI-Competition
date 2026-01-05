@@ -45,7 +45,7 @@ class Config:
     
     # Loss weights
     l1_weight = 1.0
-    ssim_weight = 1.0
+    ssim_weight = 0.0  # exp_003: L1 Lossのみ（SSIM Loss無効化）
     
     # Model
     encoder = "resnet34"
