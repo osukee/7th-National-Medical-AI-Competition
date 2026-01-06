@@ -1,6 +1,6 @@
 {
-    "id": "osukea/medical-ai-virtual-staining-training",
-    "title": "Medical AI Virtual Staining Training",
+    "id": "osukea/exp-003-l1-only",
+    "title": "exp 003 l1 only",
     "code_file": "train_notebook.py",
     "language": "python",
     "kernel_type": "script",
