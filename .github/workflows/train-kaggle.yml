@@ -58,6 +58,10 @@ jobs:
         run: |
           cd kaggle
           
+          # Extract kernel_id from metadata.json
+          KERNEL_ID=$(cat kernel-metadata.json | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
+          echo "Using kernel_id: $KERNEL_ID"
+          
           # Set environment variables for the kernel
           export EXPERIMENT_ID="${{ github.event.inputs.experiment_id || github.ref_name }}"
           export COMMIT_SHA="${{ github.sha }}"
@@ -68,7 +72,7 @@ jobs:
           echo "Pushing kernel to Kaggle..."
           kaggle kernels push
           
-          echo "kernel_id=${{ secrets.KAGGLE_USERNAME }}/medical-ai-virtual-staining-training" >> $GITHUB_OUTPUT
+          echo "kernel_id=$KERNEL_ID" >> $GITHUB_OUTPUT
 
       - name: Wait for kernel completion
         id: wait_kernel
