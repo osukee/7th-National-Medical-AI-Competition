@@ -77,18 +77,38 @@ jobs:
           echo "Waiting for kernel: $KERNEL_ID"
           
           MAX_WAIT=21600  # 6 hours in seconds
-          POLL_INTERVAL=300  # 5 minutes
+          POLL_INTERVAL=120  # 2 minutes (reduced from 5)
           ELAPSED=0
           
           while [ $ELAPSED -lt $MAX_WAIT ]; do
-            STATUS=$(kaggle kernels status "$KERNEL_ID" 2>/dev/null | grep -oP 'status "\K[^"]+' || echo "unknown")
-            echo "Status: $STATUS (elapsed: ${ELAPSED}s)"
+            # Get full status output for debugging
+            FULL_STATUS=$(kaggle kernels status "$KERNEL_ID" 2>&1 || echo "error getting status")
+            echo "Full status output: $FULL_STATUS"
+            
+            # Try multiple parsing methods
+            STATUS="unknown"
+            
+            # Method 1: Look for "has status" pattern
+            if echo "$FULL_STATUS" | grep -qi "has status.*complete"; then
+              STATUS="complete"
+            elif echo "$FULL_STATUS" | grep -qi "has status.*running"; then
+              STATUS="running"
+            elif echo "$FULL_STATUS" | grep -qi "has status.*error"; then
+              STATUS="error"
+            elif echo "$FULL_STATUS" | grep -qi "has status.*cancel"; then
+              STATUS="cancelled"
+            # Method 2: Check for "complete" anywhere
+            elif echo "$FULL_STATUS" | grep -qi "complete"; then
+              STATUS="complete"
+            fi
+            
+            echo "Parsed status: $STATUS (elapsed: ${ELAPSED}s)"
             
             if [ "$STATUS" = "complete" ]; then
               echo "Kernel completed successfully!"
               echo "status=complete" >> $GITHUB_OUTPUT
               exit 0
-            elif [ "$STATUS" = "error" ] || [ "$STATUS" = "cancelAcknowledged" ]; then
+            elif [ "$STATUS" = "error" ] || [ "$STATUS" = "cancelled" ]; then
               echo "Kernel failed with status: $STATUS"
               echo "status=failed" >> $GITHUB_OUTPUT
               exit 1
