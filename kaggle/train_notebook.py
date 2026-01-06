@@ -47,6 +47,9 @@ class Config:
     l1_weight = 1.0
     ssim_weight = 1.0
     
+    # Data augmentation
+    augment = True  # exp_002: データ拡張を有効化
+    
     # Model
     encoder = "resnet34"
     encoder_weights = "imagenet"
@@ -63,14 +66,35 @@ class Config:
 # ==============================================================================
 
 class OrganoidDataset(Dataset):
-    def __init__(self, csv_path, data_dir, image_size=512, is_test=False):
+    def __init__(self, csv_path, data_dir, image_size=512, is_test=False, augment=False):
         self.df = pd.read_csv(csv_path)
         self.data_dir = Path(data_dir)
         self.image_size = image_size
         self.is_test = is_test
+        self.augment = augment
         
     def __len__(self):
         return len(self.df)
+    
+    def _apply_augmentation(self, input_img, target_img):
+        """Apply same augmentation to input and target."""
+        # Horizontal flip (50%)
+        if np.random.random() > 0.5:
+            input_img = input_img.transpose(Image.FLIP_LEFT_RIGHT)
+            target_img = target_img.transpose(Image.FLIP_LEFT_RIGHT)
+        
+        # Vertical flip (50%)
+        if np.random.random() > 0.5:
+            input_img = input_img.transpose(Image.FLIP_TOP_BOTTOM)
+            target_img = target_img.transpose(Image.FLIP_TOP_BOTTOM)
+        
+        # Rotation (±15 degrees)
+        if np.random.random() > 0.5:
+            angle = np.random.uniform(-15, 15)
+            input_img = input_img.rotate(angle, resample=Image.BILINEAR, fillcolor=0)
+            target_img = target_img.rotate(angle, resample=Image.BILINEAR, fillcolor=0)
+        
+        return input_img, target_img
     
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
@@ -79,20 +103,29 @@ class OrganoidDataset(Dataset):
         input_path = self.data_dir / row["input_path"]
         input_img = Image.open(input_path).convert("L")
         input_img = input_img.resize((self.image_size, self.image_size), Image.BILINEAR)
-        input_arr = np.array(input_img, dtype=np.float32) / 255.0
-        input_tensor = torch.from_numpy(input_arr).unsqueeze(0)
         
         if self.is_test:
+            input_arr = np.array(input_img, dtype=np.float32) / 255.0
+            input_tensor = torch.from_numpy(input_arr).unsqueeze(0)
             return {"id": row["id"], "input": input_tensor}
         
         # Load target image
         target_path = self.data_dir / row["target_path"]
         target_img = Image.open(target_path).convert("L")
         target_img = target_img.resize((self.image_size, self.image_size), Image.BILINEAR)
+        
+        # Apply augmentation (same transform to both)
+        if self.augment:
+            input_img, target_img = self._apply_augmentation(input_img, target_img)
+        
+        input_arr = np.array(input_img, dtype=np.float32) / 255.0
         target_arr = np.array(target_img, dtype=np.float32) / 255.0
+        
+        input_tensor = torch.from_numpy(input_arr).unsqueeze(0)
         target_tensor = torch.from_numpy(target_arr).unsqueeze(0)
         
         return {"id": row["id"], "input": input_tensor, "target": target_tensor}
+
 
 
 # ==============================================================================
@@ -336,8 +369,10 @@ def train(config):
         config.train_csv,
         config.data_dir,
         config.image_size,
-        is_test=False
+        is_test=False,
+        augment=config.augment
     )
+    print(f"Augmentation: {config.augment}")
     
     # Train/Val split
     n_samples = len(full_dataset)
