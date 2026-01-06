@@ -38,7 +38,7 @@ class Config:
     
     # Training
     epochs = 3  # 50→3: ベースライン動作確認用（通過後に増やす）
-    batch_size = 8
+    batch_size = 16  # exp_004: 8→16に増加
     learning_rate = 1e-4
     weight_decay = 1e-5
     num_workers = 2
