@@ -32,7 +32,7 @@ class Config:
     output_dir = Path("/kaggle/working")
     
     # Image
-    image_size = 512
+    image_size = 256  # exp_005: 512→256に縮小
     in_channels = 1
     out_channels = 1
     
