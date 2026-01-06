@@ -1,6 +1,6 @@
 {
-    "id": "osukea/medical-ai-virtual-staining-training",
-    "title": "Medical AI Virtual Staining Training",
+    "id": "osukea/exp-002-augmentation",
+    "title": "exp_002: Data Augmentation",
     "code_file": "train_notebook.py",
     "language": "python",
     "kernel_type": "script",
