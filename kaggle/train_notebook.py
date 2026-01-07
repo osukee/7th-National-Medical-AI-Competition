@@ -384,6 +384,17 @@ def validate_with_categories(model, loader, criterion, device):
             results[f'ssim_{cat}'] = 0.0
             results[f'psnr_{cat}'] = 0.0
     
+    # Worst-case metrics: bottom 20% of Category C (the real bottleneck)
+    if category_metrics['C']['ssim']:
+        c_ssim_sorted = sorted(category_metrics['C']['ssim'])
+        c_psnr_sorted = sorted(category_metrics['C']['psnr'])
+        n_worst = max(1, len(c_ssim_sorted) // 5)  # bottom 20%
+        results['ssim_C_worst20'] = float(np.mean(c_ssim_sorted[:n_worst]))
+        results['psnr_C_worst20'] = float(np.mean(c_psnr_sorted[:n_worst]))
+    else:
+        results['ssim_C_worst20'] = 0.0
+        results['psnr_C_worst20'] = 0.0
+    
     # Overall metrics (average across categories)
     valid_ssim = [results[f'ssim_{c}'] for c in ['A', 'B', 'C'] if results[f'ssim_{c}'] > 0]
     valid_psnr = [results[f'psnr_{c}'] for c in ['A', 'B', 'C'] if results[f'psnr_{c}'] > 0]
@@ -612,9 +623,11 @@ def train_kfold(config, n_folds=5):
             'ssim_A': final_metrics['ssim_A'],
             'ssim_B': final_metrics['ssim_B'],
             'ssim_C': final_metrics['ssim_C'],
+            'ssim_C_worst20': final_metrics['ssim_C_worst20'],
             'psnr_A': final_metrics['psnr_A'],
             'psnr_B': final_metrics['psnr_B'],
             'psnr_C': final_metrics['psnr_C'],
+            'psnr_C_worst20': final_metrics['psnr_C_worst20'],
         })
         
         if final_metrics['ssim'] > best_overall_ssim:
@@ -646,6 +659,11 @@ def train_kfold(config, n_folds=5):
                 'psnr_mean': float(np.mean([r['psnr_C'] for r in fold_results])),
             },
         },
+        'worst_case': {
+            'ssim_C_worst20_mean': float(np.mean([r['ssim_C_worst20'] for r in fold_results])),
+            'ssim_C_worst20_min': float(min([r['ssim_C_worst20'] for r in fold_results])),
+            'psnr_C_worst20_mean': float(np.mean([r['psnr_C_worst20'] for r in fold_results])),
+        },
         'fold_results': fold_results,
         'best_fold': best_fold + 1,
     }
@@ -660,6 +678,9 @@ def train_kfold(config, n_folds=5):
     print(f"  A: {cv_results['category_metrics']['A']['ssim_mean']:.4f}")
     print(f"  B: {cv_results['category_metrics']['B']['ssim_mean']:.4f}")
     print(f"  C: {cv_results['category_metrics']['C']['ssim_mean']:.4f}")
+    print(f"\n⚠️  WORST-CASE (C bottom 20%):")
+    print(f"  SSIM mean: {cv_results['worst_case']['ssim_C_worst20_mean']:.4f}")
+    print(f"  SSIM min:  {cv_results['worst_case']['ssim_C_worst20_min']:.4f}  ← LB刺されポイント")
     print(f"\nBest fold: {best_fold + 1} (SSIM: {best_overall_ssim:.4f})")
     print(f"Training Time: {training_time/60:.1f} minutes")
     print(f"{'='*60}")
