@@ -18,6 +18,8 @@ from PIL import Image
 from skimage.metrics import structural_similarity as ssim
 from skimage.metrics import peak_signal_noise_ratio as psnr
 from sklearn.model_selection import StratifiedKFold
+from sklearn.cluster import KMeans
+from sklearn.preprocessing import StandardScaler
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 
@@ -57,6 +59,80 @@ class Config:
     
     # Seed
     seed = 42
+
+# ==============================================================================
+# Category C Sub-Clustering
+# ==============================================================================
+
+def cluster_category_c(df, data_dir, n_clusters=3):
+    """
+    Cluster Category C samples into difficulty sub-groups.
+    Uses image brightness, contrast, and dark pixel ratio as features.
+    Returns df with 'difficulty' column (A, B, C_easy, C_medium, C_hard)
+    """
+    print("Clustering Category C into difficulty sub-groups...")
+    
+    # Initialize difficulty column
+    df = df.copy()
+    df['difficulty'] = df['category']  # Default: A, B stay as-is
+    
+    df_c = df[df['category'] == 'C']
+    if len(df_c) == 0:
+        return df
+    
+    # Extract features from C samples
+    features = []
+    valid_indices = []
+    
+    for idx, row in df_c.iterrows():
+        try:
+            input_path = Path(data_dir) / row['input_path']
+            img = Image.open(input_path).convert('L')
+            arr = np.array(img)
+            
+            brightness = arr.mean()
+            contrast = arr.std()
+            dark_ratio = (arr < 50).sum() / arr.size
+            
+            features.append([brightness, contrast, dark_ratio])
+            valid_indices.append(idx)
+        except Exception:
+            continue
+    
+    if len(features) < n_clusters:
+        print(f"Not enough valid C samples for clustering: {len(features)}")
+        return df
+    
+    features = np.array(features)
+    
+    # Standardize and cluster
+    scaler = StandardScaler()
+    features_scaled = scaler.fit_transform(features)
+    
+    kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+    clusters = kmeans.fit_predict(features_scaled)
+    
+    # Determine difficulty by dark_ratio (higher = harder)
+    cluster_dark_ratios = []
+    for c in range(n_clusters):
+        mask = clusters == c
+        mean_dark = features[mask, 2].mean()  # dark_ratio is index 2
+        cluster_dark_ratios.append((c, mean_dark))
+    
+    # Sort by dark ratio (ascending = easy to hard)
+    cluster_dark_ratios.sort(key=lambda x: x[1])
+    
+    labels = ['C_easy', 'C_medium', 'C_hard'] if n_clusters == 3 else ['C_easy', 'C_hard']
+    difficulty_map = {c: labels[i] for i, (c, _) in enumerate(cluster_dark_ratios)}
+    
+    # Assign difficulty labels
+    for i, idx in enumerate(valid_indices):
+        df.loc[idx, 'difficulty'] = difficulty_map[clusters[i]]
+    
+    # Print distribution
+    print(f"Difficulty distribution: {df['difficulty'].value_counts().to_dict()}")
+    
+    return df
 
 
 # ==============================================================================
@@ -531,12 +607,12 @@ def train(config):
 
 
 def train_kfold(config, n_folds=5):
-    """Train using Stratified K-Fold Cross-Validation with category-wise metrics."""
+    """Train using Stratified K-Fold Cross-Validation with difficulty-based stratification."""
     start_time = time.time()
     set_seed(config.seed)
     
     print(f"{'='*60}")
-    print(f"Stratified {n_folds}-Fold Cross-Validation")
+    print(f"Stratified {n_folds}-Fold Cross-Validation (by Difficulty)")
     print(f"{'='*60}")
     print(f"Device: {config.device}")
     print(f"Epochs per fold: {config.epochs}")
@@ -547,14 +623,17 @@ def train_kfold(config, n_folds=5):
     print(f"Total samples: {len(df)}")
     print(f"Category distribution: {df['category'].value_counts().to_dict()}")
     
-    # Stratified K-Fold
+    # Cluster Category C into difficulty sub-groups (A, B, C_easy, C_medium, C_hard)
+    df = cluster_category_c(df, config.data_dir, n_clusters=3)
+    
+    # Stratified K-Fold by difficulty (not just category)
     skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=config.seed)
     
     fold_results = []
     best_overall_ssim = 0
     best_fold = -1
     
-    for fold, (train_idx, val_idx) in enumerate(skf.split(df, df['category'])):
+    for fold, (train_idx, val_idx) in enumerate(skf.split(df, df['difficulty'])):
         print(f"\n{'='*60}")
         print(f"FOLD {fold + 1}/{n_folds}")
         print(f"Train: {len(train_idx)}, Val: {len(val_idx)}")
