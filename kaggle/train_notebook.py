@@ -17,6 +17,7 @@ import torch.optim as optim
 from PIL import Image
 from skimage.metrics import structural_similarity as ssim
 from skimage.metrics import peak_signal_noise_ratio as psnr
+from sklearn.model_selection import StratifiedKFold
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 
@@ -63,8 +64,15 @@ class Config:
 # ==============================================================================
 
 class OrganoidDataset(Dataset):
-    def __init__(self, csv_path, data_dir, image_size=512, is_test=False):
-        self.df = pd.read_csv(csv_path)
+    def __init__(self, csv_path_or_df, data_dir, image_size=512, is_test=False, indices=None):
+        if isinstance(csv_path_or_df, pd.DataFrame):
+            self.df = csv_path_or_df.copy()
+        else:
+            self.df = pd.read_csv(csv_path_or_df)
+        
+        if indices is not None:
+            self.df = self.df.iloc[indices].reset_index(drop=True)
+        
         self.data_dir = Path(data_dir)
         self.image_size = image_size
         self.is_test = is_test
@@ -92,7 +100,10 @@ class OrganoidDataset(Dataset):
         target_arr = np.array(target_img, dtype=np.float32) / 255.0
         target_tensor = torch.from_numpy(target_arr).unsqueeze(0)
         
-        return {"id": row["id"], "input": input_tensor, "target": target_tensor}
+        # Include category for stratified evaluation
+        category = row.get("category", "unknown")
+        
+        return {"id": row["id"], "input": input_tensor, "target": target_tensor, "category": category}
 
 
 # ==============================================================================
@@ -323,7 +334,68 @@ def validate(model, loader, criterion, device):
     }
 
 
+def validate_with_categories(model, loader, criterion, device):
+    """Validation with category-wise metrics."""
+    model.eval()
+    total_loss = 0
+    n_batches = 0
+    
+    category_metrics = {
+        'A': {'ssim': [], 'psnr': []},
+        'B': {'ssim': [], 'psnr': []},
+        'C': {'ssim': [], 'psnr': []},
+    }
+    
+    with torch.no_grad():
+        for batch in tqdm(loader, desc="Validation"):
+            inputs = batch["input"].to(device)
+            targets = batch["target"].to(device)
+            categories = batch["category"]
+            
+            outputs = torch.clamp(model(inputs), 0, 1)
+            
+            loss = criterion(outputs, targets)
+            total_loss += loss.item()
+            n_batches += 1
+            
+            # Calculate per-sample metrics and group by category
+            pred_np = outputs.cpu().numpy()
+            target_np = targets.cpu().numpy()
+            
+            for i, cat in enumerate(categories):
+                p = np.clip(pred_np[i, 0], 0, 1)
+                t = np.clip(target_np[i, 0], 0, 1)
+                
+                s = ssim(t, p, data_range=1.0)
+                pn = psnr(t, p, data_range=1.0)
+                
+                if cat in category_metrics:
+                    category_metrics[cat]['ssim'].append(s)
+                    category_metrics[cat]['psnr'].append(pn)
+    
+    # Compute category-wise means
+    results = {"loss": total_loss / n_batches}
+    
+    for cat in ['A', 'B', 'C']:
+        if category_metrics[cat]['ssim']:
+            results[f'ssim_{cat}'] = float(np.mean(category_metrics[cat]['ssim']))
+            results[f'psnr_{cat}'] = float(np.mean(category_metrics[cat]['psnr']))
+        else:
+            results[f'ssim_{cat}'] = 0.0
+            results[f'psnr_{cat}'] = 0.0
+    
+    # Overall metrics (average across categories)
+    valid_ssim = [results[f'ssim_{c}'] for c in ['A', 'B', 'C'] if results[f'ssim_{c}'] > 0]
+    valid_psnr = [results[f'psnr_{c}'] for c in ['A', 'B', 'C'] if results[f'psnr_{c}'] > 0]
+    
+    results['ssim'] = float(np.mean(valid_ssim)) if valid_ssim else 0.0
+    results['psnr'] = float(np.mean(valid_psnr)) if valid_psnr else 0.0
+    
+    return results
+
+
 def train(config):
+    """Original train function (single split, kept for backwards compatibility)."""
     start_time = time.time()
     set_seed(config.seed)
     
@@ -447,6 +519,183 @@ def train(config):
     return model, history
 
 
+def train_kfold(config, n_folds=5):
+    """Train using Stratified K-Fold Cross-Validation with category-wise metrics."""
+    start_time = time.time()
+    set_seed(config.seed)
+    
+    print(f"{'='*60}")
+    print(f"Stratified {n_folds}-Fold Cross-Validation")
+    print(f"{'='*60}")
+    print(f"Device: {config.device}")
+    print(f"Epochs per fold: {config.epochs}")
+    print(f"Batch size: {config.batch_size}")
+    
+    # Load full dataframe
+    df = pd.read_csv(config.train_csv)
+    print(f"Total samples: {len(df)}")
+    print(f"Category distribution: {df['category'].value_counts().to_dict()}")
+    
+    # Stratified K-Fold
+    skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=config.seed)
+    
+    fold_results = []
+    best_overall_ssim = 0
+    best_fold = -1
+    
+    for fold, (train_idx, val_idx) in enumerate(skf.split(df, df['category'])):
+        print(f"\n{'='*60}")
+        print(f"FOLD {fold + 1}/{n_folds}")
+        print(f"Train: {len(train_idx)}, Val: {len(val_idx)}")
+        print(f"{'='*60}")
+        
+        # Create datasets with indices
+        train_dataset = OrganoidDataset(
+            df, config.data_dir, config.image_size, is_test=False, indices=train_idx
+        )
+        val_dataset = OrganoidDataset(
+            df, config.data_dir, config.image_size, is_test=False, indices=val_idx
+        )
+        
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=config.batch_size,
+            shuffle=True,
+            num_workers=config.num_workers,
+            pin_memory=True
+        )
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=config.batch_size,
+            shuffle=False,
+            num_workers=config.num_workers,
+            pin_memory=True
+        )
+        
+        # Create fresh model for each fold
+        model = create_model(config)
+        
+        criterion = CombinedLoss(config.l1_weight, config.ssim_weight)
+        optimizer = optim.AdamW(
+            model.parameters(),
+            lr=config.learning_rate,
+            weight_decay=config.weight_decay
+        )
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, config.epochs)
+        
+        # Training loop for this fold
+        best_fold_ssim = 0
+        
+        for epoch in range(config.epochs):
+            print(f"\nFold {fold+1} - Epoch {epoch + 1}/{config.epochs}")
+            
+            train_loss = train_epoch(model, train_loader, criterion, optimizer, config.device)
+            val_metrics = validate_with_categories(model, val_loader, criterion, config.device)
+            
+            scheduler.step()
+            
+            print(f"Train Loss: {train_loss:.4f}")
+            print(f"Val SSIM: {val_metrics['ssim']:.4f} (A:{val_metrics['ssim_A']:.4f}, B:{val_metrics['ssim_B']:.4f}, C:{val_metrics['ssim_C']:.4f})")
+            print(f"Val PSNR: {val_metrics['psnr']:.2f} (A:{val_metrics['psnr_A']:.2f}, B:{val_metrics['psnr_B']:.2f}, C:{val_metrics['psnr_C']:.2f})")
+            
+            if val_metrics['ssim'] > best_fold_ssim:
+                best_fold_ssim = val_metrics['ssim']
+                # Save best model for this fold
+                torch.save(model.state_dict(), config.output_dir / f"best_model_fold{fold}.pth")
+        
+        # Store fold results
+        final_metrics = validate_with_categories(model, val_loader, criterion, config.device)
+        fold_results.append({
+            'fold': fold + 1,
+            'ssim': final_metrics['ssim'],
+            'psnr': final_metrics['psnr'],
+            'ssim_A': final_metrics['ssim_A'],
+            'ssim_B': final_metrics['ssim_B'],
+            'ssim_C': final_metrics['ssim_C'],
+            'psnr_A': final_metrics['psnr_A'],
+            'psnr_B': final_metrics['psnr_B'],
+            'psnr_C': final_metrics['psnr_C'],
+        })
+        
+        if final_metrics['ssim'] > best_overall_ssim:
+            best_overall_ssim = final_metrics['ssim']
+            best_fold = fold
+            # Save as overall best model
+            torch.save(model.state_dict(), config.output_dir / "best_model.pth")
+    
+    training_time = time.time() - start_time
+    
+    # Aggregate results
+    cv_results = {
+        'n_folds': n_folds,
+        'ssim_mean': float(np.mean([r['ssim'] for r in fold_results])),
+        'ssim_std': float(np.std([r['ssim'] for r in fold_results])),
+        'psnr_mean': float(np.mean([r['psnr'] for r in fold_results])),
+        'psnr_std': float(np.std([r['psnr'] for r in fold_results])),
+        'category_metrics': {
+            'A': {
+                'ssim_mean': float(np.mean([r['ssim_A'] for r in fold_results])),
+                'psnr_mean': float(np.mean([r['psnr_A'] for r in fold_results])),
+            },
+            'B': {
+                'ssim_mean': float(np.mean([r['ssim_B'] for r in fold_results])),
+                'psnr_mean': float(np.mean([r['psnr_B'] for r in fold_results])),
+            },
+            'C': {
+                'ssim_mean': float(np.mean([r['ssim_C'] for r in fold_results])),
+                'psnr_mean': float(np.mean([r['psnr_C'] for r in fold_results])),
+            },
+        },
+        'fold_results': fold_results,
+        'best_fold': best_fold + 1,
+    }
+    
+    # Print summary
+    print(f"\n{'='*60}")
+    print(f"Cross-Validation Complete!")
+    print(f"{'='*60}")
+    print(f"Overall SSIM: {cv_results['ssim_mean']:.4f} ± {cv_results['ssim_std']:.4f}")
+    print(f"Overall PSNR: {cv_results['psnr_mean']:.2f} ± {cv_results['psnr_std']:.2f}")
+    print(f"\nCategory-wise SSIM:")
+    print(f"  A: {cv_results['category_metrics']['A']['ssim_mean']:.4f}")
+    print(f"  B: {cv_results['category_metrics']['B']['ssim_mean']:.4f}")
+    print(f"  C: {cv_results['category_metrics']['C']['ssim_mean']:.4f}")
+    print(f"\nBest fold: {best_fold + 1} (SSIM: {best_overall_ssim:.4f})")
+    print(f"Training Time: {training_time/60:.1f} minutes")
+    print(f"{'='*60}")
+    
+    # Save final metrics
+    final_output = {
+        "experiment_id": os.environ.get("EXPERIMENT_ID", "kaggle_run"),
+        "timestamp": datetime.now().isoformat(),
+        "commit_sha": os.environ.get("COMMIT_SHA", "unknown"),
+        "branch": os.environ.get("BRANCH_NAME", "unknown"),
+        "cv_results": cv_results,
+        "metrics": {
+            "ssim": cv_results['ssim_mean'],
+            "psnr": cv_results['psnr_mean'],
+            "ssim_std": cv_results['ssim_std'],
+            "psnr_std": cv_results['psnr_std'],
+        },
+        "training_time_seconds": int(training_time),
+        "config": {
+            "n_folds": n_folds,
+            "epochs": config.epochs,
+            "batch_size": config.batch_size,
+            "learning_rate": config.learning_rate,
+            "image_size": config.image_size,
+        }
+    }
+    
+    with open(config.output_dir / "metrics.json", "w") as f:
+        json.dump(final_output, f, indent=2)
+    
+    with open(config.output_dir / "cv_results.json", "w") as f:
+        json.dump(cv_results, f, indent=2)
+    
+    return cv_results
+
+
 # ==============================================================================
 # Main
 # ==============================================================================
@@ -462,4 +711,11 @@ if __name__ == "__main__":
     if os.environ.get("LEARNING_RATE"):
         config.learning_rate = float(os.environ["LEARNING_RATE"])
     
-    train(config)
+    # Use K-Fold CV if N_FOLDS is set, otherwise use single split
+    n_folds = int(os.environ.get("N_FOLDS", "0"))
+    
+    if n_folds > 1:
+        train_kfold(config, n_folds=n_folds)
+    else:
+        train(config)
+

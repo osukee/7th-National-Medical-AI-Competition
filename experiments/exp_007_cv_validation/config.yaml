@@ -1,0 +1,35 @@
+# exp_007: Stratified K-Fold Cross-Validation Validation
+# Goal: Validate Stratified K-Fold implementation and identify category bottlenecks
+
+experiment_id: exp_007_cv_validation
+description: Validate Stratified K-Fold CV implementation with category-wise metrics
+
+# Training settings
+training:
+  epochs: 5          # 5 epochs per fold for validation (5 folds × 5 epochs = 25 total)
+  batch_size: 8
+  learning_rate: 0.0001
+  weight_decay: 0.00001
+
+# CV settings
+cv:
+  n_folds: 5         # 5-Fold Cross-Validation
+  stratify_by: category
+
+# Loss settings
+loss:
+  l1_weight: 1.0
+  ssim_weight: 2.0   # Inherited from exp_006
+
+# Model settings
+model:
+  encoder: resnet34
+  encoder_weights: imagenet
+  image_size: 512
+
+# Expected outputs
+expected_outputs:
+  - cv_results.json   # Category-wise metrics for all folds
+  - metrics.json      # Aggregated results
+  - best_model.pth    # Best performing model overall
+  - best_model_fold*.pth  # Best model per fold
