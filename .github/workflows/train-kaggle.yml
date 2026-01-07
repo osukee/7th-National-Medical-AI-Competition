@@ -15,6 +15,10 @@ on:
         description: 'Experiment ID for tracking'
         required: false
         default: 'manual_run'
+      n_folds:
+        description: 'Number of CV folds (0 for single split)'
+        required: false
+        default: '5'
   push:
     branches:
       - 'experiment/**'
@@ -66,8 +70,9 @@ jobs:
           export EXPERIMENT_ID="${{ github.event.inputs.experiment_id || github.ref_name }}"
           export COMMIT_SHA="${{ github.sha }}"
           export BRANCH_NAME="${{ github.ref_name }}"
-          export EPOCHS="${{ github.event.inputs.epochs || '3' }}"
+          export EPOCHS="${{ github.event.inputs.epochs || '5' }}"
           export BATCH_SIZE="${{ github.event.inputs.batch_size || '8' }}"
+          export N_FOLDS="${{ github.event.inputs.n_folds || '5' }}"
           
           echo "Pushing kernel to Kaggle..."
           kaggle kernels push
