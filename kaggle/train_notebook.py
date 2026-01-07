@@ -711,8 +711,8 @@ if __name__ == "__main__":
     if os.environ.get("LEARNING_RATE"):
         config.learning_rate = float(os.environ["LEARNING_RATE"])
     
-    # Use K-Fold CV if N_FOLDS is set, otherwise use single split
-    n_folds = int(os.environ.get("N_FOLDS", "0"))
+    # Use K-Fold CV if N_FOLDS is set, otherwise default to 5-fold
+    n_folds = int(os.environ.get("N_FOLDS", "5"))  # Default: 5-fold CV
     
     if n_folds > 1:
         train_kfold(config, n_folds=n_folds)
