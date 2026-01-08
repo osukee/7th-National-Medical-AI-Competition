@@ -18,8 +18,6 @@ from PIL import Image
 from skimage.metrics import structural_similarity as ssim
 from skimage.metrics import peak_signal_noise_ratio as psnr
 from sklearn.model_selection import StratifiedKFold
-from sklearn.cluster import KMeans
-from sklearn.preprocessing import StandardScaler
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 
@@ -61,78 +59,93 @@ class Config:
     seed = 42
 
 # ==============================================================================
-# Category C Sub-Clustering
+# Dark Ratio Computation (Continuous, No Clustering)
 # ==============================================================================
 
-def cluster_category_c(df, data_dir, n_clusters=3):
+def compute_dark_ratio(df, data_dir):
     """
-    Cluster Category C samples into difficulty sub-groups.
-    Uses image brightness, contrast, and dark pixel ratio as features.
-    Returns df with 'difficulty' column (A, B, C_easy, C_medium, C_hard)
-    """
-    print("Clustering Category C into difficulty sub-groups...")
+    Compute dark_ratio for all samples as a continuous difficulty measure.
+    No discrete clustering - this avoids boundary artifacts.
     
-    # Initialize difficulty column
+    Returns df with 'dark_ratio' column added.
+    """
+    print("Computing dark_ratio for all samples...")
+    
     df = df.copy()
-    df['difficulty'] = df['category']  # Default: A, B stay as-is
+    df['dark_ratio'] = 0.0
     
-    df_c = df[df['category'] == 'C']
-    if len(df_c) == 0:
-        return df
-    
-    # Extract features from C samples
-    features = []
-    valid_indices = []
-    
-    for idx, row in df_c.iterrows():
+    for idx, row in df.iterrows():
         try:
             input_path = Path(data_dir) / row['input_path']
             img = Image.open(input_path).convert('L')
             arr = np.array(img)
             
-            brightness = arr.mean()
-            contrast = arr.std()
+            # dark_ratio: percentage of very dark pixels (< 50)
             dark_ratio = (arr < 50).sum() / arr.size
-            
-            features.append([brightness, contrast, dark_ratio])
-            valid_indices.append(idx)
+            df.loc[idx, 'dark_ratio'] = dark_ratio
         except Exception:
-            continue
+            df.loc[idx, 'dark_ratio'] = 0.0
     
-    if len(features) < n_clusters:
-        print(f"Not enough valid C samples for clustering: {len(features)}")
-        return df
-    
-    features = np.array(features)
-    
-    # Standardize and cluster
-    scaler = StandardScaler()
-    features_scaled = scaler.fit_transform(features)
-    
-    kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
-    clusters = kmeans.fit_predict(features_scaled)
-    
-    # Determine difficulty by dark_ratio (higher = harder)
-    cluster_dark_ratios = []
-    for c in range(n_clusters):
-        mask = clusters == c
-        mean_dark = features[mask, 2].mean()  # dark_ratio is index 2
-        cluster_dark_ratios.append((c, mean_dark))
-    
-    # Sort by dark ratio (ascending = easy to hard)
-    cluster_dark_ratios.sort(key=lambda x: x[1])
-    
-    labels = ['C_easy', 'C_medium', 'C_hard'] if n_clusters == 3 else ['C_easy', 'C_hard']
-    difficulty_map = {c: labels[i] for i, (c, _) in enumerate(cluster_dark_ratios)}
-    
-    # Assign difficulty labels
-    for i, idx in enumerate(valid_indices):
-        df.loc[idx, 'difficulty'] = difficulty_map[clusters[i]]
-    
-    # Print distribution
-    print(f"Difficulty distribution: {df['difficulty'].value_counts().to_dict()}")
+    print(f"Dark ratio stats: mean={df['dark_ratio'].mean():.3f}, "
+          f"std={df['dark_ratio'].std():.3f}, "
+          f"min={df['dark_ratio'].min():.3f}, max={df['dark_ratio'].max():.3f}")
     
     return df
+
+
+def create_worst_case_splits(df, data_dir, worst_val_ratio=0.20, c_hard_train_ratio=0.60):
+    """
+    Create worst-case controlled CV splits.
+    
+    Strategy:
+    1. Sort all samples by dark_ratio (continuous, no boundaries)
+    2. Top 20% of C (by dark_ratio) → worst_val (fixed across all folds)
+    3. Next 40% of C_hard → Train fixed (60%)
+    4. Remaining samples → Normal Stratified K-Fold
+    
+    Returns:
+        - worst_val_idx: Fixed validation indices for worst-case (evaluated every fold)
+        - trainable_idx: Indices available for K-Fold splitting
+        - c_hard_train_idx: C_hard samples fixed in train
+    """
+    # Compute dark_ratio if not already present
+    if 'dark_ratio' not in df.columns:
+        df = compute_dark_ratio(df, data_dir)
+    
+    # Get Category C samples sorted by dark_ratio (descending = harder first)
+    c_mask = df['category'] == 'C'
+    df_c = df[c_mask].sort_values('dark_ratio', ascending=False)
+    
+    n_c = len(df_c)
+    n_worst = int(n_c * worst_val_ratio)  # top 20% = ~80 samples
+    n_c_hard = int(n_c * 0.40)  # next 40% after worst = ~160 samples
+    n_c_hard_train = int(n_c_hard * c_hard_train_ratio)  # 60% of C_hard → train fixed
+    
+    # Split C samples
+    worst_val_idx = df_c.index[:n_worst].tolist()
+    c_hard_idx = df_c.index[n_worst:n_worst + n_c_hard].tolist()
+    c_hard_train_idx = c_hard_idx[:n_c_hard_train]
+    c_hard_foldable_idx = c_hard_idx[n_c_hard_train:]
+    c_normal_idx = df_c.index[n_worst + n_c_hard:].tolist()
+    
+    # Get A, B samples
+    ab_idx = df[~c_mask].index.tolist()
+    
+    # Trainable = A, B, C_normal, C_hard foldable (not worst_val, not c_hard_train)
+    trainable_idx = ab_idx + c_normal_idx + c_hard_foldable_idx
+    
+    print(f"\nWorst-Case Split Summary:")
+    print(f"  worst_val (fixed):      {len(worst_val_idx)} samples (C dark_ratio top {worst_val_ratio*100:.0f}%)")
+    print(f"  c_hard_train (fixed):   {len(c_hard_train_idx)} samples (60% of C_hard)")
+    print(f"  trainable (K-Fold):     {len(trainable_idx)} samples")
+    print(f"  Total:                  {len(worst_val_idx) + len(c_hard_train_idx) + len(trainable_idx)}")
+    
+    return {
+        'worst_val_idx': worst_val_idx,
+        'c_hard_train_idx': c_hard_train_idx,
+        'trainable_idx': trainable_idx,
+        'df': df,  # df with dark_ratio column
+    }
 
 
 # ==============================================================================
@@ -796,6 +809,261 @@ def train_kfold(config, n_folds=5):
     return cv_results
 
 
+def validate_worst_val(model, df, worst_val_idx, data_dir, device, image_size):
+    """Validate on the fixed worst_val set (dark_ratio top 20% of C)."""
+    model.eval()
+    
+    worst_val_df = df.loc[worst_val_idx]
+    dataset = OrganoidDataset(worst_val_df, data_dir, image_size, is_test=False)
+    loader = DataLoader(dataset, batch_size=8, shuffle=False, num_workers=2)
+    
+    ssim_scores = []
+    psnr_scores = []
+    
+    with torch.no_grad():
+        for batch in loader:
+            inputs = batch["input"].to(device)
+            targets = batch["target"].to(device)
+            outputs = torch.clamp(model(inputs), 0, 1)
+            
+            pred_np = outputs.cpu().numpy()
+            target_np = targets.cpu().numpy()
+            
+            for i in range(pred_np.shape[0]):
+                p = np.clip(pred_np[i, 0], 0, 1)
+                t = np.clip(target_np[i, 0], 0, 1)
+                ssim_scores.append(ssim(t, p, data_range=1.0))
+                psnr_scores.append(psnr(t, p, data_range=1.0))
+    
+    return {
+        'ssim_worst_val_mean': float(np.mean(ssim_scores)),
+        'ssim_worst_val_min': float(np.min(ssim_scores)),
+        'ssim_worst_val_std': float(np.std(ssim_scores)),
+        'psnr_worst_val_mean': float(np.mean(psnr_scores)),
+    }
+
+
+def train_worst_case_cv(config, n_folds=5):
+    """
+    Train using Worst-Case Controlled CV.
+    
+    Key differences from train_kfold:
+    1. worst_val is fixed across all folds (dark_ratio top 20% of C)
+    2. c_hard_train is fixed in train (60% of C_hard)
+    3. KPI is ssim_worst_val_min (not mean SSIM)
+    """
+    start_time = time.time()
+    set_seed(config.seed)
+    
+    print(f"{'='*60}")
+    print(f"Worst-Case Controlled {n_folds}-Fold Cross-Validation")
+    print(f"{'='*60}")
+    print(f"Device: {config.device}")
+    print(f"Epochs per fold: {config.epochs}")
+    print(f"Batch size: {config.batch_size}")
+    
+    # Load full dataframe
+    df = pd.read_csv(config.train_csv)
+    print(f"Total samples: {len(df)}")
+    print(f"Category distribution: {df['category'].value_counts().to_dict()}")
+    
+    # Create worst-case splits
+    splits = create_worst_case_splits(df, config.data_dir)
+    df = splits['df']  # df with dark_ratio
+    worst_val_idx = splits['worst_val_idx']
+    c_hard_train_idx = splits['c_hard_train_idx']
+    trainable_idx = splits['trainable_idx']
+    
+    # Create sub-dataframe for K-Fold (excludes worst_val and c_hard_train)
+    df_trainable = df.loc[trainable_idx].reset_index(drop=True)
+    
+    # Stratified K-Fold on trainable samples (by category)
+    skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=config.seed)
+    
+    fold_results = []
+    worst_val_results = []
+    best_overall_ssim = 0
+    best_fold = -1
+    
+    for fold, (train_idx, val_idx) in enumerate(skf.split(df_trainable, df_trainable['category'])):
+        print(f"\n{'='*60}")
+        print(f"FOLD {fold + 1}/{n_folds}")
+        print(f"{'='*60}")
+        
+        # Convert back to original indices
+        train_original_idx = df_trainable.iloc[train_idx].index.tolist()
+        val_original_idx = df_trainable.iloc[val_idx].index.tolist()
+        
+        # Add c_hard_train to train set (fixed)
+        train_all_idx = train_original_idx + c_hard_train_idx
+        
+        print(f"Train: {len(train_all_idx)} (incl. {len(c_hard_train_idx)} fixed C_hard)")
+        print(f"Val: {len(val_original_idx)}")
+        print(f"Worst-Val (fixed): {len(worst_val_idx)}")
+        
+        # Create datasets
+        train_df = df.loc[train_all_idx]
+        val_df = df.loc[val_original_idx]
+        
+        train_dataset = OrganoidDataset(train_df, config.data_dir, config.image_size, is_test=False)
+        val_dataset = OrganoidDataset(val_df, config.data_dir, config.image_size, is_test=False)
+        
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=config.batch_size,
+            shuffle=True,
+            num_workers=config.num_workers,
+            pin_memory=True
+        )
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=config.batch_size,
+            shuffle=False,
+            num_workers=config.num_workers,
+            pin_memory=True
+        )
+        
+        # Create fresh model for each fold
+        model = create_model(config)
+        
+        criterion = CombinedLoss(config.l1_weight, config.ssim_weight)
+        optimizer = optim.AdamW(
+            model.parameters(),
+            lr=config.learning_rate,
+            weight_decay=config.weight_decay
+        )
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, config.epochs)
+        
+        # Training loop for this fold
+        best_fold_worst_val = 0
+        
+        for epoch in range(config.epochs):
+            print(f"\nFold {fold+1} - Epoch {epoch + 1}/{config.epochs}")
+            
+            train_loss = train_epoch(model, train_loader, criterion, optimizer, config.device)
+            val_metrics = validate_with_categories(model, val_loader, criterion, config.device)
+            
+            # Evaluate worst_val (the key metric)
+            worst_val_metrics = validate_worst_val(
+                model, df, worst_val_idx, config.data_dir, config.device, config.image_size
+            )
+            
+            scheduler.step()
+            
+            print(f"Train Loss: {train_loss:.4f}")
+            print(f"Val SSIM: {val_metrics['ssim']:.4f}")
+            print(f"⚠️  Worst-Val SSIM: {worst_val_metrics['ssim_worst_val_mean']:.4f} "
+                  f"(min: {worst_val_metrics['ssim_worst_val_min']:.4f})")
+            
+            # Save best model based on worst_val performance
+            if worst_val_metrics['ssim_worst_val_mean'] > best_fold_worst_val:
+                best_fold_worst_val = worst_val_metrics['ssim_worst_val_mean']
+                torch.save(model.state_dict(), config.output_dir / f"best_model_fold{fold}.pth")
+        
+        # Store fold results
+        final_val_metrics = validate_with_categories(model, val_loader, criterion, config.device)
+        final_worst_val = validate_worst_val(
+            model, df, worst_val_idx, config.data_dir, config.device, config.image_size
+        )
+        
+        fold_results.append({
+            'fold': fold + 1,
+            'ssim': final_val_metrics['ssim'],
+            'psnr': final_val_metrics['psnr'],
+            'ssim_A': final_val_metrics['ssim_A'],
+            'ssim_B': final_val_metrics['ssim_B'],
+            'ssim_C': final_val_metrics['ssim_C'],
+        })
+        
+        worst_val_results.append({
+            'fold': fold + 1,
+            'ssim_worst_val_mean': final_worst_val['ssim_worst_val_mean'],
+            'ssim_worst_val_min': final_worst_val['ssim_worst_val_min'],
+            'ssim_worst_val_std': final_worst_val['ssim_worst_val_std'],
+        })
+        
+        if final_worst_val['ssim_worst_val_mean'] > best_overall_ssim:
+            best_overall_ssim = final_worst_val['ssim_worst_val_mean']
+            best_fold = fold
+            torch.save(model.state_dict(), config.output_dir / "best_model.pth")
+    
+    training_time = time.time() - start_time
+    
+    # Aggregate results
+    cv_results = {
+        'n_folds': n_folds,
+        'cv_mode': 'worst_case_controlled',
+        'ssim_mean': float(np.mean([r['ssim'] for r in fold_results])),
+        'ssim_std': float(np.std([r['ssim'] for r in fold_results])),
+        'psnr_mean': float(np.mean([r['psnr'] for r in fold_results])),
+        'psnr_std': float(np.std([r['psnr'] for r in fold_results])),
+        'category_metrics': {
+            'A': {'ssim_mean': float(np.mean([r['ssim_A'] for r in fold_results]))},
+            'B': {'ssim_mean': float(np.mean([r['ssim_B'] for r in fold_results]))},
+            'C': {'ssim_mean': float(np.mean([r['ssim_C'] for r in fold_results]))},
+        },
+        'worst_val': {
+            'n_samples': len(worst_val_idx),
+            'ssim_mean': float(np.mean([r['ssim_worst_val_mean'] for r in worst_val_results])),
+            'ssim_min': float(min([r['ssim_worst_val_min'] for r in worst_val_results])),
+            'ssim_std_across_folds': float(np.std([r['ssim_worst_val_mean'] for r in worst_val_results])),
+        },
+        'fold_results': fold_results,
+        'worst_val_results': worst_val_results,
+        'best_fold': best_fold + 1,
+    }
+    
+    # Print summary
+    print(f"\n{'='*60}")
+    print(f"Worst-Case Controlled CV Complete!")
+    print(f"{'='*60}")
+    print(f"Overall SSIM: {cv_results['ssim_mean']:.4f} ± {cv_results['ssim_std']:.4f}")
+    print(f"\nCategory-wise SSIM:")
+    print(f"  A: {cv_results['category_metrics']['A']['ssim_mean']:.4f}")
+    print(f"  B: {cv_results['category_metrics']['B']['ssim_mean']:.4f}")
+    print(f"  C: {cv_results['category_metrics']['C']['ssim_mean']:.4f}")
+    print(f"\n🎯 WORST-VAL (Fixed, {len(worst_val_idx)} samples):")
+    print(f"  SSIM mean: {cv_results['worst_val']['ssim_mean']:.4f}")
+    print(f"  SSIM min:  {cv_results['worst_val']['ssim_min']:.4f}  ← NEW KPI!")
+    print(f"  Std across folds: {cv_results['worst_val']['ssim_std_across_folds']:.4f}")
+    print(f"\nBest fold: {best_fold + 1}")
+    print(f"Training Time: {training_time/60:.1f} minutes")
+    print(f"{'='*60}")
+    
+    # Save final metrics
+    final_output = {
+        "experiment_id": os.environ.get("EXPERIMENT_ID", "kaggle_run"),
+        "timestamp": datetime.now().isoformat(),
+        "commit_sha": os.environ.get("COMMIT_SHA", "unknown"),
+        "branch": os.environ.get("BRANCH_NAME", "unknown"),
+        "cv_mode": "worst_case_controlled",
+        "cv_results": cv_results,
+        "metrics": {
+            "ssim": cv_results['ssim_mean'],
+            "psnr": cv_results['psnr_mean'],
+            "ssim_std": cv_results['ssim_std'],
+            "psnr_std": cv_results['psnr_std'],
+            "ssim_worst_val_min": cv_results['worst_val']['ssim_min'],
+        },
+        "training_time_seconds": int(training_time),
+        "config": {
+            "n_folds": n_folds,
+            "epochs": config.epochs,
+            "batch_size": config.batch_size,
+            "learning_rate": config.learning_rate,
+            "image_size": config.image_size,
+        }
+    }
+    
+    with open(config.output_dir / "metrics.json", "w") as f:
+        json.dump(final_output, f, indent=2)
+    
+    with open(config.output_dir / "cv_results.json", "w") as f:
+        json.dump(cv_results, f, indent=2)
+    
+    return cv_results
+
+
 # ==============================================================================
 # Main
 # ==============================================================================
@@ -811,11 +1079,19 @@ if __name__ == "__main__":
     if os.environ.get("LEARNING_RATE"):
         config.learning_rate = float(os.environ["LEARNING_RATE"])
     
-    # Use K-Fold CV if N_FOLDS is set, otherwise default to 5-fold
+    # CV mode selection
+    cv_mode = os.environ.get("CV_MODE", "worst_case")  # Default: worst_case
     n_folds = int(os.environ.get("N_FOLDS", "5"))  # Default: 5-fold CV
     
-    if n_folds > 1:
+    print(f"CV Mode: {cv_mode}")
+    
+    if cv_mode == "worst_case":
+        # NEW: Worst-Case Controlled CV (recommended)
+        train_worst_case_cv(config, n_folds=n_folds)
+    elif cv_mode == "kfold" and n_folds > 1:
+        # Legacy: Stratified K-Fold (for comparison)
         train_kfold(config, n_folds=n_folds)
     else:
+        # Single split (for debugging)
         train(config)
 

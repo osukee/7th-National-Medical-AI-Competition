@@ -205,6 +205,45 @@ for fold, (train_idx, val_idx) in enumerate(skf.split(df, df['category'])):
 
 ---
 
+### 7.4 exp_007 v4: Worst-Case Controlled CV
+
+**実施日**: 2026-01-08
+
+**設計変更** (v3の失敗から学習):
+
+| 変更点 | v3 | v4 |
+|--------|-----|-----|
+| クラスタリング | 離散 (C_easy/medium/hard) | **連続値 (dark_ratio)** |
+| C_hard の扱い | 全foldに分散 | **60%をTrain固定** |
+| Worst評価 | 事後抽出 | **worst_val固定 (top 20%)** |
+| KPI | ssim_C_worst20_min | **ssim_worst_val_min** |
+
+**実装**:
+```python
+# 環境変数で切り替え (デフォルト: worst_case)
+CV_MODE=worst_case python kaggle/train_notebook.py
+
+# 旧モード (比較用)
+CV_MODE=kfold python kaggle/train_notebook.py
+```
+
+**Split構造**:
+```
+Total: 1200 samples
+├── worst_val (固定): 80 samples (C dark_ratio top 20%)
+├── c_hard_train (固定): 96 samples (C_hard 60%)
+└── trainable (K-Fold): 1024 samples
+```
+
+**結果**: (実行後に記入)
+
+| Metric | v3 | v4 | 変化 |
+|--------|-----|-----|------|
+| ssim_mean | 0.8714 | TBD | |
+| ssim_worst_val_min | 0.6544 | TBD | |
+
+---
+
 ## 8. 学んだ教訓
 
 ### 8.1 CV設計の盲点

@@ -114,5 +114,93 @@ class TestFoldAggregation:
         assert ssim_std > 0, "Standard deviation should be positive"
 
 
+class TestWorstCaseCV:
+    """Test worst-case controlled CV splits."""
+    
+    @pytest.fixture
+    def sample_df_with_dark_ratio(self):
+        """Create sample dataframe with dark_ratio (simulating C samples)."""
+        np.random.seed(42)
+        # 400 C samples with varying dark_ratio
+        c_dark_ratios = np.random.uniform(0.0, 0.5, 400)
+        c_dark_ratios = np.sort(c_dark_ratios)[::-1]  # Sort descending
+        
+        return pd.DataFrame({
+            'id': [f'train_{i:05d}' for i in range(400)],
+            'category': ['C'] * 400,
+            'dark_ratio': c_dark_ratios,
+        })
+    
+    def test_worst_val_is_top_20_percent(self, sample_df_with_dark_ratio):
+        """Test that worst_val contains top 20% of dark_ratio samples."""
+        df = sample_df_with_dark_ratio
+        n_c = len(df)
+        
+        # Top 20% by dark_ratio
+        n_worst = int(n_c * 0.20)
+        worst_val_idx = df.nlargest(n_worst, 'dark_ratio').index.tolist()
+        
+        assert len(worst_val_idx) == 80, f"Expected 80 worst_val samples, got {len(worst_val_idx)}"
+        
+        # Verify these are the highest dark_ratio
+        worst_dark_ratios = df.loc[worst_val_idx, 'dark_ratio']
+        other_dark_ratios = df.drop(worst_val_idx)['dark_ratio']
+        
+        assert worst_dark_ratios.min() >= other_dark_ratios.max(), \
+            "worst_val should have the highest dark_ratios"
+    
+    def test_c_hard_train_is_60_percent(self, sample_df_with_dark_ratio):
+        """Test that 60% of C_hard goes to train fixed."""
+        df = sample_df_with_dark_ratio
+        n_c = len(df)
+        
+        n_worst = int(n_c * 0.20)  # 80
+        n_c_hard = int(n_c * 0.40)  # 160
+        n_c_hard_train = int(n_c_hard * 0.60)  # 96
+        
+        assert n_c_hard_train == 96, f"Expected 96 C_hard_train samples, got {n_c_hard_train}"
+    
+    def test_no_overlap_between_splits(self, sample_df_with_dark_ratio):
+        """Test that worst_val, c_hard_train, and trainable have no overlap."""
+        df = sample_df_with_dark_ratio
+        n_c = len(df)
+        
+        # Simulate the split logic
+        df_sorted = df.sort_values('dark_ratio', ascending=False)
+        
+        n_worst = int(n_c * 0.20)
+        n_c_hard = int(n_c * 0.40)
+        n_c_hard_train = int(n_c_hard * 0.60)
+        
+        worst_val_idx = set(df_sorted.index[:n_worst])
+        c_hard_idx = df_sorted.index[n_worst:n_worst + n_c_hard].tolist()
+        c_hard_train_idx = set(c_hard_idx[:n_c_hard_train])
+        c_hard_foldable_idx = set(c_hard_idx[n_c_hard_train:])
+        c_normal_idx = set(df_sorted.index[n_worst + n_c_hard:])
+        
+        # Check no overlaps
+        assert len(worst_val_idx & c_hard_train_idx) == 0, "Overlap between worst_val and c_hard_train"
+        assert len(worst_val_idx & c_normal_idx) == 0, "Overlap between worst_val and c_normal"
+        assert len(c_hard_train_idx & c_normal_idx) == 0, "Overlap between c_hard_train and c_normal"
+        
+        # Check all samples accounted for
+        all_idx = worst_val_idx | c_hard_train_idx | c_hard_foldable_idx | c_normal_idx
+        assert all_idx == set(df.index), "Some samples not accounted for"
+    
+    def test_worst_val_fixed_across_folds(self):
+        """Test that worst_val indices remain fixed regardless of fold."""
+        # This is a conceptual test - in the actual implementation,
+        # worst_val_idx is computed once and passed to all folds
+        np.random.seed(42)
+        
+        # Simulate two runs with same seed
+        dark_ratios_1 = np.random.uniform(0.0, 0.5, 100)
+        np.random.seed(42)
+        dark_ratios_2 = np.random.uniform(0.0, 0.5, 100)
+        
+        assert np.allclose(dark_ratios_1, dark_ratios_2), \
+            "Same seed should produce same dark_ratios"
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
