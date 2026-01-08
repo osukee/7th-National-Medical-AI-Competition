@@ -148,29 +148,99 @@ def create_worst_case_splits(df, data_dir, worst_val_ratio=0.20, c_hard_train_ra
     }
 
 
+def create_worst_case_splits_v5(df, data_dir):
+    """
+    v5: Worst-case splits with worst_val split into train and eval.
+    
+    Key changes from v4:
+    - worst_train (top 10% of C): Goes to Train with Loss×3
+    - worst_eval (10-20% of C): Evaluation only
+    - c_hard_train: Train with Loss×2
+    
+    Returns dict with sample weights for loss weighting.
+    """
+    # Compute dark_ratio if not already present
+    if 'dark_ratio' not in df.columns:
+        df = compute_dark_ratio(df, data_dir)
+    
+    # Get Category C samples sorted by dark_ratio (descending = harder first)
+    c_mask = df['category'] == 'C'
+    df_c = df[c_mask].sort_values('dark_ratio', ascending=False)
+    
+    n_c = len(df_c)
+    n_worst_train = int(n_c * 0.10)  # top 10% → Train with Loss×3
+    n_worst_eval = int(n_c * 0.10)   # next 10% → Eval only
+    n_c_hard = int(n_c * 0.30)       # next 30% → C_hard
+    n_c_hard_train = int(n_c_hard * 0.60)  # 60% of C_hard → Train with Loss×2
+    
+    # Split C samples
+    worst_train_idx = df_c.index[:n_worst_train].tolist()
+    worst_eval_idx = df_c.index[n_worst_train:n_worst_train + n_worst_eval].tolist()
+    c_hard_idx = df_c.index[n_worst_train + n_worst_eval:n_worst_train + n_worst_eval + n_c_hard].tolist()
+    c_hard_train_idx = c_hard_idx[:n_c_hard_train]
+    c_hard_foldable_idx = c_hard_idx[n_c_hard_train:]
+    c_normal_idx = df_c.index[n_worst_train + n_worst_eval + n_c_hard:].tolist()
+    
+    # Get A, B samples
+    ab_idx = df[~c_mask].index.tolist()
+    
+    # Trainable = A, B, C_normal, C_hard foldable
+    trainable_idx = ab_idx + c_normal_idx + c_hard_foldable_idx
+    
+    # Create sample weight mapping (for loss weighting)
+    sample_weights = {}
+    for idx in worst_train_idx:
+        sample_weights[idx] = 3.0  # worst_train: ×3
+    for idx in c_hard_train_idx:
+        sample_weights[idx] = 2.0  # c_hard_train: ×2
+    # Others default to 1.0
+    
+    print(f"\nv5 Worst-Case Split Summary:")
+    print(f"  worst_train (Train, Loss×3): {len(worst_train_idx)} samples (C dark_ratio top 10%)")
+    print(f"  worst_eval (Eval only):      {len(worst_eval_idx)} samples (C dark_ratio 10-20%)")
+    print(f"  c_hard_train (Train, Loss×2): {len(c_hard_train_idx)} samples")
+    print(f"  trainable (K-Fold):           {len(trainable_idx)} samples")
+    
+    return {
+        'worst_train_idx': worst_train_idx,
+        'worst_eval_idx': worst_eval_idx,
+        'c_hard_train_idx': c_hard_train_idx,
+        'trainable_idx': trainable_idx,
+        'sample_weights': sample_weights,
+        'df': df,
+    }
+
 # ==============================================================================
 # Dataset
 # ==============================================================================
 
 class OrganoidDataset(Dataset):
-    def __init__(self, csv_path_or_df, data_dir, image_size=512, is_test=False, indices=None):
+    def __init__(self, csv_path_or_df, data_dir, image_size=512, is_test=False, indices=None, sample_weights=None):
         if isinstance(csv_path_or_df, pd.DataFrame):
             self.df = csv_path_or_df.copy()
         else:
             self.df = pd.read_csv(csv_path_or_df)
         
+        # Store original indices before reset
         if indices is not None:
-            self.df = self.df.iloc[indices].reset_index(drop=True)
+            self.original_indices = indices
+            self.df = self.df.loc[indices].reset_index(drop=True)
+        else:
+            self.original_indices = self.df.index.tolist()
         
         self.data_dir = Path(data_dir)
         self.image_size = image_size
         self.is_test = is_test
+        
+        # Sample weights for loss weighting (v5)
+        self.sample_weights = sample_weights or {}
         
     def __len__(self):
         return len(self.df)
     
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
+        original_idx = self.original_indices[idx] if idx < len(self.original_indices) else idx
         
         # Load input image
         input_path = self.data_dir / row["input_path"]
@@ -192,7 +262,16 @@ class OrganoidDataset(Dataset):
         # Include category for stratified evaluation
         category = row.get("category", "unknown")
         
-        return {"id": row["id"], "input": input_tensor, "target": target_tensor, "category": category}
+        # Get sample weight (default 1.0)
+        weight = self.sample_weights.get(original_idx, 1.0)
+        
+        return {
+            "id": row["id"], 
+            "input": input_tensor, 
+            "target": target_tensor, 
+            "category": category,
+            "weight": torch.tensor(weight, dtype=torch.float32),
+        }
 
 
 # ==============================================================================
@@ -392,6 +471,39 @@ def train_epoch(model, loader, criterion, optimizer, device):
         pbar.set_postfix({"loss": f"{loss.item():.4f}"})
     
     return total_loss / len(loader)
+
+
+def train_epoch_weighted(model, loader, criterion, optimizer, device):
+    """Training epoch with sample-wise loss weighting for v5."""
+    model.train()
+    total_loss = 0
+    total_weighted_loss = 0
+    
+    pbar = tqdm(loader, desc="Training (weighted)")
+    for batch in pbar:
+        inputs = batch["input"].to(device)
+        targets = batch["target"].to(device)
+        weights = batch["weight"].to(device)  # Sample weights
+        
+        optimizer.zero_grad()
+        outputs = torch.clamp(model(inputs), 0, 1)
+        
+        # Compute per-sample loss and apply weights
+        batch_size = inputs.size(0)
+        sample_losses = []
+        for i in range(batch_size):
+            sample_loss = criterion(outputs[i:i+1], targets[i:i+1])
+            sample_losses.append(sample_loss * weights[i])
+        
+        # Weighted mean loss
+        weighted_loss = torch.stack(sample_losses).mean()
+        weighted_loss.backward()
+        optimizer.step()
+        
+        total_weighted_loss += weighted_loss.item()
+        pbar.set_postfix({"w_loss": f"{weighted_loss.item():.4f}"})
+    
+    return total_weighted_loss / len(loader)
 
 
 def validate(model, loader, criterion, device):
@@ -1064,6 +1176,227 @@ def train_worst_case_cv(config, n_folds=5):
     return cv_results
 
 
+def train_worst_case_cv_v5(config, n_folds=5):
+    """
+    v5: Train with worst_val integrated into training.
+    
+    Key changes:
+    - worst_train (top 10% of C): Train with Loss×3
+    - worst_eval (10-20% of C): Evaluation only
+    - c_hard_train: Train with Loss×2
+    """
+    start_time = time.time()
+    set_seed(config.seed)
+    
+    print(f"{'='*60}")
+    print(f"v5: Worst-Case Integrated {n_folds}-Fold CV")
+    print(f"{'='*60}")
+    print(f"Device: {config.device}")
+    print(f"Epochs per fold: {config.epochs}")
+    
+    # Load full dataframe
+    df = pd.read_csv(config.train_csv)
+    print(f"Total samples: {len(df)}")
+    
+    # Create v5 splits
+    splits = create_worst_case_splits_v5(df, config.data_dir)
+    df = splits['df']
+    worst_train_idx = splits['worst_train_idx']
+    worst_eval_idx = splits['worst_eval_idx']
+    c_hard_train_idx = splits['c_hard_train_idx']
+    trainable_idx = splits['trainable_idx']
+    sample_weights = splits['sample_weights']
+    
+    # Create sub-dataframe for K-Fold
+    df_trainable = df.loc[trainable_idx].reset_index(drop=True)
+    
+    skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=config.seed)
+    
+    fold_results = []
+    worst_eval_results = []
+    best_overall_ssim = 0
+    best_fold = -1
+    
+    for fold, (train_idx, val_idx) in enumerate(skf.split(df_trainable, df_trainable['category'])):
+        print(f"\n{'='*60}")
+        print(f"FOLD {fold + 1}/{n_folds}")
+        print(f"{'='*60}")
+        
+        # Get original indices
+        train_original_idx = df_trainable.iloc[train_idx].index.tolist()
+        val_original_idx = df_trainable.iloc[val_idx].index.tolist()
+        
+        # Combine train indices: trainable_fold + worst_train + c_hard_train
+        train_all_idx = train_original_idx + worst_train_idx + c_hard_train_idx
+        
+        print(f"Train: {len(train_all_idx)} (incl. {len(worst_train_idx)} worst_train×3, {len(c_hard_train_idx)} c_hard×2)")
+        print(f"Val: {len(val_original_idx)}")
+        print(f"Worst-Eval (fixed): {len(worst_eval_idx)}")
+        
+        # Create datasets with sample weights
+        train_df = df.loc[train_all_idx]
+        val_df = df.loc[val_original_idx]
+        
+        train_dataset = OrganoidDataset(
+            train_df, config.data_dir, config.image_size, 
+            is_test=False, sample_weights=sample_weights
+        )
+        val_dataset = OrganoidDataset(
+            val_df, config.data_dir, config.image_size, is_test=False
+        )
+        
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=config.batch_size,
+            shuffle=True,
+            num_workers=config.num_workers,
+            pin_memory=True
+        )
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=config.batch_size,
+            shuffle=False,
+            num_workers=config.num_workers,
+            pin_memory=True
+        )
+        
+        # Create model
+        model = create_model(config)
+        criterion = CombinedLoss(config.l1_weight, config.ssim_weight)
+        optimizer = optim.AdamW(
+            model.parameters(),
+            lr=config.learning_rate,
+            weight_decay=config.weight_decay
+        )
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, config.epochs)
+        
+        best_fold_worst_eval = 0
+        
+        for epoch in range(config.epochs):
+            print(f"\nFold {fold+1} - Epoch {epoch + 1}/{config.epochs}")
+            
+            # Use weighted training
+            train_loss = train_epoch_weighted(model, train_loader, criterion, optimizer, config.device)
+            val_metrics = validate_with_categories(model, val_loader, criterion, config.device)
+            
+            # Evaluate on worst_eval (fixed set)
+            worst_eval_metrics = validate_worst_val(
+                model, df, worst_eval_idx, config.data_dir, config.device, config.image_size
+            )
+            
+            scheduler.step()
+            
+            print(f"Train Loss (weighted): {train_loss:.4f}")
+            print(f"Val SSIM: {val_metrics['ssim']:.4f}")
+            print(f"🎯 Worst-Eval SSIM: {worst_eval_metrics['ssim_worst_val_mean']:.4f} "
+                  f"(min: {worst_eval_metrics['ssim_worst_val_min']:.4f})")
+            
+            if worst_eval_metrics['ssim_worst_val_mean'] > best_fold_worst_eval:
+                best_fold_worst_eval = worst_eval_metrics['ssim_worst_val_mean']
+                torch.save(model.state_dict(), config.output_dir / f"best_model_fold{fold}.pth")
+        
+        # Store results
+        final_val = validate_with_categories(model, val_loader, criterion, config.device)
+        final_worst_eval = validate_worst_val(
+            model, df, worst_eval_idx, config.data_dir, config.device, config.image_size
+        )
+        
+        fold_results.append({
+            'fold': fold + 1,
+            'ssim': final_val['ssim'],
+            'psnr': final_val['psnr'],
+            'ssim_A': final_val['ssim_A'],
+            'ssim_B': final_val['ssim_B'],
+            'ssim_C': final_val['ssim_C'],
+        })
+        
+        worst_eval_results.append({
+            'fold': fold + 1,
+            'ssim_worst_eval_mean': final_worst_eval['ssim_worst_val_mean'],
+            'ssim_worst_eval_min': final_worst_eval['ssim_worst_val_min'],
+            'ssim_worst_eval_std': final_worst_eval['ssim_worst_val_std'],
+        })
+        
+        if final_worst_eval['ssim_worst_val_mean'] > best_overall_ssim:
+            best_overall_ssim = final_worst_eval['ssim_worst_val_mean']
+            best_fold = fold
+            torch.save(model.state_dict(), config.output_dir / "best_model.pth")
+    
+    training_time = time.time() - start_time
+    
+    # Aggregate results
+    cv_results = {
+        'n_folds': n_folds,
+        'cv_mode': 'worst_case_v5',
+        'ssim_mean': float(np.mean([r['ssim'] for r in fold_results])),
+        'ssim_std': float(np.std([r['ssim'] for r in fold_results])),
+        'psnr_mean': float(np.mean([r['psnr'] for r in fold_results])),
+        'category_metrics': {
+            'A': {'ssim_mean': float(np.mean([r['ssim_A'] for r in fold_results]))},
+            'B': {'ssim_mean': float(np.mean([r['ssim_B'] for r in fold_results]))},
+            'C': {'ssim_mean': float(np.mean([r['ssim_C'] for r in fold_results]))},
+        },
+        'worst_eval': {
+            'n_samples': len(worst_eval_idx),
+            'ssim_mean': float(np.mean([r['ssim_worst_eval_mean'] for r in worst_eval_results])),
+            'ssim_min': float(min([r['ssim_worst_eval_min'] for r in worst_eval_results])),
+            'ssim_std_across_folds': float(np.std([r['ssim_worst_eval_mean'] for r in worst_eval_results])),
+        },
+        'fold_results': fold_results,
+        'worst_eval_results': worst_eval_results,
+        'best_fold': best_fold + 1,
+    }
+    
+    # Print summary
+    print(f"\n{'='*60}")
+    print(f"v5 Worst-Case Integrated CV Complete!")
+    print(f"{'='*60}")
+    print(f"Overall SSIM: {cv_results['ssim_mean']:.4f} ± {cv_results['ssim_std']:.4f}")
+    print(f"\nCategory-wise SSIM:")
+    print(f"  A: {cv_results['category_metrics']['A']['ssim_mean']:.4f}")
+    print(f"  B: {cv_results['category_metrics']['B']['ssim_mean']:.4f}")
+    print(f"  C: {cv_results['category_metrics']['C']['ssim_mean']:.4f}")
+    print(f"\n🎯 WORST-EVAL (Fixed, {len(worst_eval_idx)} samples):")
+    print(f"  SSIM mean: {cv_results['worst_eval']['ssim_mean']:.4f}")
+    print(f"  SSIM min:  {cv_results['worst_eval']['ssim_min']:.4f}  ← v5 KPI")
+    print(f"  Std across folds: {cv_results['worst_eval']['ssim_std_across_folds']:.4f}")
+    print(f"\nBest fold: {best_fold + 1}")
+    print(f"Training Time: {training_time/60:.1f} minutes")
+    print(f"{'='*60}")
+    
+    # Save metrics
+    final_output = {
+        "experiment_id": os.environ.get("EXPERIMENT_ID", "kaggle_run"),
+        "timestamp": datetime.now().isoformat(),
+        "commit_sha": os.environ.get("COMMIT_SHA", "unknown"),
+        "branch": os.environ.get("BRANCH_NAME", "unknown"),
+        "cv_mode": "worst_case_v5",
+        "cv_results": cv_results,
+        "metrics": {
+            "ssim": cv_results['ssim_mean'],
+            "psnr": cv_results['psnr_mean'],
+            "ssim_std": cv_results['ssim_std'],
+            "ssim_worst_eval_min": cv_results['worst_eval']['ssim_min'],
+        },
+        "training_time_seconds": int(training_time),
+        "config": {
+            "n_folds": n_folds,
+            "epochs": config.epochs,
+            "batch_size": config.batch_size,
+            "learning_rate": config.learning_rate,
+            "image_size": config.image_size,
+        }
+    }
+    
+    with open(config.output_dir / "metrics.json", "w") as f:
+        json.dump(final_output, f, indent=2)
+    
+    with open(config.output_dir / "cv_results.json", "w") as f:
+        json.dump(cv_results, f, indent=2)
+    
+    return cv_results
+
+
 # ==============================================================================
 # Main
 # ==============================================================================
@@ -1080,16 +1413,19 @@ if __name__ == "__main__":
         config.learning_rate = float(os.environ["LEARNING_RATE"])
     
     # CV mode selection
-    cv_mode = os.environ.get("CV_MODE", "worst_case")  # Default: worst_case
-    n_folds = int(os.environ.get("N_FOLDS", "5"))  # Default: 5-fold CV
+    cv_mode = os.environ.get("CV_MODE", "worst_case_v5")  # Default: v5
+    n_folds = int(os.environ.get("N_FOLDS", "5"))
     
     print(f"CV Mode: {cv_mode}")
     
-    if cv_mode == "worst_case":
-        # NEW: Worst-Case Controlled CV (recommended)
+    if cv_mode == "worst_case_v5":
+        # v5: Worst-case with weighted training (recommended)
+        train_worst_case_cv_v5(config, n_folds=n_folds)
+    elif cv_mode == "worst_case":
+        # v4: Worst-case controlled (eval only)
         train_worst_case_cv(config, n_folds=n_folds)
     elif cv_mode == "kfold" and n_folds > 1:
-        # Legacy: Stratified K-Fold (for comparison)
+        # Legacy: Stratified K-Fold
         train_kfold(config, n_folds=n_folds)
     else:
         # Single split (for debugging)
