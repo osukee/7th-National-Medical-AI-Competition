@@ -1398,6 +1398,74 @@ def train_worst_case_cv_v5(config, n_folds=5):
 
 
 # ==============================================================================
+# Inference and Submission
+# ==============================================================================
+
+def predict_and_submit(config, model_path=None):
+    """
+    Run inference on test set and create submission.
+    Saves predicted images to output_dir/submission/
+    """
+    print(f"\n{'='*60}")
+    print("Running Inference on Test Set")
+    print(f"{'='*60}")
+    
+    # Load model
+    model = create_model(config)
+    
+    if model_path is None:
+        model_path = config.output_dir / "best_model.pth"
+    
+    if not model_path.exists():
+        print(f"Model not found at {model_path}")
+        return
+    
+    model.load_state_dict(torch.load(model_path, map_location=config.device))
+    model.eval()
+    print(f"Loaded model from {model_path}")
+    
+    # Load test data
+    test_df = pd.read_csv(config.test_csv)
+    print(f"Test samples: {len(test_df)}")
+    
+    test_dataset = OrganoidDataset(
+        test_df, config.data_dir, config.image_size, is_test=True
+    )
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=config.batch_size,
+        shuffle=False,
+        num_workers=config.num_workers
+    )
+    
+    # Create submission directory
+    submission_dir = config.output_dir / "submission"
+    submission_dir.mkdir(exist_ok=True)
+    
+    # Run inference
+    with torch.no_grad():
+        for batch in tqdm(test_loader, desc="Inference"):
+            inputs = batch["input"].to(config.device)
+            ids = batch["id"]
+            
+            outputs = torch.clamp(model(inputs), 0, 1)
+            
+            # Save each prediction
+            for i, sample_id in enumerate(ids):
+                pred = outputs[i, 0].cpu().numpy()
+                pred_uint8 = (pred * 255).astype(np.uint8)
+                
+                # Save as PNG
+                img = Image.fromarray(pred_uint8)
+                img.save(submission_dir / f"{sample_id}.png")
+    
+    print(f"\nSubmission saved to: {submission_dir}")
+    print(f"Total predictions: {len(list(submission_dir.glob('*.png')))}")
+    
+    return submission_dir
+
+
+# ==============================================================================
 # Main
 # ==============================================================================
 
@@ -1415,19 +1483,22 @@ if __name__ == "__main__":
     # CV mode selection
     cv_mode = os.environ.get("CV_MODE", "worst_case_v5")  # Default: v5
     n_folds = int(os.environ.get("N_FOLDS", "5"))
+    run_inference = os.environ.get("RUN_INFERENCE", "1") == "1"  # Default: run inference
     
     print(f"CV Mode: {cv_mode}")
+    print(f"Run Inference: {run_inference}")
     
+    # Training
     if cv_mode == "worst_case_v5":
-        # v5: Worst-case with weighted training (recommended)
         train_worst_case_cv_v5(config, n_folds=n_folds)
     elif cv_mode == "worst_case":
-        # v4: Worst-case controlled (eval only)
         train_worst_case_cv(config, n_folds=n_folds)
     elif cv_mode == "kfold" and n_folds > 1:
-        # Legacy: Stratified K-Fold
         train_kfold(config, n_folds=n_folds)
     else:
-        # Single split (for debugging)
         train(config)
+    
+    # Inference (for LB submission)
+    if run_inference:
+        predict_and_submit(config)
 
