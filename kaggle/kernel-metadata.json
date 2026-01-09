@@ -1,7 +1,7 @@
 {
     "id": "osukea/medical-ai-virtual-staining-training",
     "title": "Medical AI Virtual Staining Training",
-    "code_file": "train_notebook.py",
+    "code_file": "train_baseline_v2.py",
     "language": "python",
     "kernel_type": "script",
     "is_private": true,
