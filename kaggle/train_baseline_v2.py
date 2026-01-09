@@ -40,8 +40,8 @@ class Config:
     in_channels = 1
     out_channels = 1
     
-    # Training - KEY CHANGE: epochs=15
-    epochs = 15
+    # Training - KEY CHANGE: epochs=30 for convergence check
+    epochs = 30
     batch_size = 8
     learning_rate = 1e-4
     weight_decay = 1e-5
