@@ -1466,6 +1466,14 @@ def predict_and_submit(config, model_path=None):
     
     # Create submission DataFrame
     print(f"\nCreating submission CSV...")
+    print(f"Number of samples: {len(all_ids)}")
+    print(f"Pixels per sample: {len(all_pixels[0]) if all_pixels else 0}")
+    
+    # Debug: show first sample info
+    if all_pixels:
+        first_pixels = all_pixels[0]
+        print(f"First sample ID: {all_ids[0]}")
+        print(f"First sample pixel stats: min={first_pixels.min()}, max={first_pixels.max()}, mean={first_pixels.mean():.1f}")
     
     # Column names: id, pixel_0, pixel_1, ..., pixel_262143
     n_pixels = 512 * 512  # 262,144
@@ -1482,6 +1490,10 @@ def predict_and_submit(config, model_path=None):
     print(f"📄 Submission CSV created: {csv_path}")
     print(f"   Shape: {submission_df.shape}")
     print(f"   Size: {csv_path.stat().st_size / 1024 / 1024:.1f} MB")
+    print(f"   First row preview:")
+    print(f"   id: {submission_df.iloc[0]['id']}")
+    print(f"   pixel_0: {submission_df.iloc[0]['pixel_0']}")
+    print(f"   pixel_262143: {submission_df.iloc[0]['pixel_262143']}")
     print(f"{'='*60}")
     
     return csv_path
