@@ -1404,8 +1404,10 @@ def train_worst_case_cv_v5(config, n_folds=5):
 def predict_and_submit(config, model_path=None):
     """
     Run inference on test set and create submission.
-    Saves predicted images to output_dir/submission/
+    Saves predicted images to output_dir/submission/ and creates submission.zip
     """
+    import zipfile
+    
     print(f"\n{'='*60}")
     print("Running Inference on Test Set")
     print(f"{'='*60}")
@@ -1418,7 +1420,7 @@ def predict_and_submit(config, model_path=None):
     
     if not model_path.exists():
         print(f"Model not found at {model_path}")
-        return
+        return None
     
     model.load_state_dict(torch.load(model_path, map_location=config.device))
     model.eval()
@@ -1459,10 +1461,21 @@ def predict_and_submit(config, model_path=None):
                 img = Image.fromarray(pred_uint8)
                 img.save(submission_dir / f"{sample_id}.png")
     
-    print(f"\nSubmission saved to: {submission_dir}")
+    print(f"\nPredictions saved to: {submission_dir}")
     print(f"Total predictions: {len(list(submission_dir.glob('*.png')))}")
     
-    return submission_dir
+    # Create submission.zip
+    zip_path = config.output_dir / "submission.zip"
+    with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+        for png_file in submission_dir.glob('*.png'):
+            zipf.write(png_file, png_file.name)
+    
+    print(f"\n{'='*60}")
+    print(f"📦 Submission zip created: {zip_path}")
+    print(f"   Size: {zip_path.stat().st_size / 1024 / 1024:.1f} MB")
+    print(f"{'='*60}")
+    
+    return zip_path
 
 
 # ==============================================================================
