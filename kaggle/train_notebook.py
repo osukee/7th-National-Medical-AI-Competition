@@ -1403,11 +1403,13 @@ def train_worst_case_cv_v5(config, n_folds=5):
 
 def predict_and_submit(config, model_path=None):
     """
-    Run inference on test set and create submission.
-    Saves predicted images to output_dir/submission/ and creates submission.zip
-    """
-    import zipfile
+    Run inference on test set and create submission CSV.
     
+    Submission format:
+    - 512×512 image flattened to 262,144 pixels
+    - CSV columns: id, pixel_0, pixel_1, ..., pixel_262143
+    - Values: 0-255 (uint8)
+    """
     print(f"\n{'='*60}")
     print("Running Inference on Test Set")
     print(f"{'='*60}")
@@ -1440,11 +1442,10 @@ def predict_and_submit(config, model_path=None):
         num_workers=config.num_workers
     )
     
-    # Create submission directory
-    submission_dir = config.output_dir / "submission"
-    submission_dir.mkdir(exist_ok=True)
+    # Collect predictions
+    all_ids = []
+    all_pixels = []
     
-    # Run inference
     with torch.no_grad():
         for batch in tqdm(test_loader, desc="Inference"):
             inputs = batch["input"].to(config.device)
@@ -1452,30 +1453,38 @@ def predict_and_submit(config, model_path=None):
             
             outputs = torch.clamp(model(inputs), 0, 1)
             
-            # Save each prediction
             for i, sample_id in enumerate(ids):
+                # Get prediction as 512x512 array
                 pred = outputs[i, 0].cpu().numpy()
+                # Convert to uint8 (0-255)
                 pred_uint8 = (pred * 255).astype(np.uint8)
+                # Flatten to 1D (262,144 pixels)
+                pixels_flat = pred_uint8.flatten()
                 
-                # Save as PNG
-                img = Image.fromarray(pred_uint8)
-                img.save(submission_dir / f"{sample_id}.png")
+                all_ids.append(sample_id)
+                all_pixels.append(pixels_flat)
     
-    print(f"\nPredictions saved to: {submission_dir}")
-    print(f"Total predictions: {len(list(submission_dir.glob('*.png')))}")
+    # Create submission DataFrame
+    print(f"\nCreating submission CSV...")
     
-    # Create submission.zip
-    zip_path = config.output_dir / "submission.zip"
-    with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
-        for png_file in submission_dir.glob('*.png'):
-            zipf.write(png_file, png_file.name)
+    # Column names: id, pixel_0, pixel_1, ..., pixel_262143
+    n_pixels = 512 * 512  # 262,144
+    pixel_columns = [f"pixel_{i}" for i in range(n_pixels)]
+    
+    submission_df = pd.DataFrame(all_pixels, columns=pixel_columns)
+    submission_df.insert(0, "id", all_ids)
+    
+    # Save CSV
+    csv_path = config.output_dir / "submission.csv"
+    submission_df.to_csv(csv_path, index=False)
     
     print(f"\n{'='*60}")
-    print(f"📦 Submission zip created: {zip_path}")
-    print(f"   Size: {zip_path.stat().st_size / 1024 / 1024:.1f} MB")
+    print(f"📄 Submission CSV created: {csv_path}")
+    print(f"   Shape: {submission_df.shape}")
+    print(f"   Size: {csv_path.stat().st_size / 1024 / 1024:.1f} MB")
     print(f"{'='*60}")
     
-    return zip_path
+    return csv_path
 
 
 # ==============================================================================
