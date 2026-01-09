@@ -40,17 +40,17 @@ class Config:
     in_channels = 1
     out_channels = 1
     
-    # Training - KEY CHANGE: epochs=30 for convergence check
-    epochs = 30
+    # Training - epochs=15 (convergence confirmed at 30)
+    epochs = 15
     batch_size = 8
     learning_rate = 1e-4
     weight_decay = 1e-5
     num_workers = 2
     
-    # Loss weights - As suggested: SSIM + 0.1*L1 + 0.02*MSE
+    # Loss weights - MSE increased: 0.02 → 0.1 to push PSNR
     ssim_weight = 1.0
     l1_weight = 0.1
-    mse_weight = 0.02
+    mse_weight = 0.1
     
     # Model
     encoder = "resnet34"
