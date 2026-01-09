@@ -1446,6 +1446,8 @@ def predict_and_submit(config, model_path=None):
     all_ids = []
     all_pixels = []
     
+    import cv2  # For resizing
+    
     with torch.no_grad():
         for batch in tqdm(test_loader, desc="Inference"):
             inputs = batch["input"].to(config.device)
@@ -1454,11 +1456,18 @@ def predict_and_submit(config, model_path=None):
             outputs = torch.clamp(model(inputs), 0, 1)
             
             for i, sample_id in enumerate(ids):
-                # Get prediction as 512x512 array
+                # Get prediction as numpy array
                 pred = outputs[i, 0].cpu().numpy()
+                
                 # Convert to uint8 (0-255)
                 pred_uint8 = (pred * 255).astype(np.uint8)
-                # Flatten to 1D (262,144 pixels)
+                
+                # Ensure exactly 512x512 (as per baseline)
+                if pred_uint8.shape != (512, 512):
+                    print(f"Resizing from {pred_uint8.shape} to (512, 512)")
+                    pred_uint8 = cv2.resize(pred_uint8, (512, 512))
+                
+                # Flatten to 1D (262,144 pixels) - Row-major ('C') order
                 pixels_flat = pred_uint8.flatten()
                 
                 all_ids.append(sample_id)
