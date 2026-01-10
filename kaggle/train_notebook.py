@@ -3,6 +3,16 @@ Medical AI Competition Training Script for Kaggle
 This script is designed to run on Kaggle's GPU environment.
 """
 
+# Install segmentation-models-pytorch if not available
+import subprocess
+import sys
+try:
+    import segmentation_models_pytorch
+except ImportError:
+    print("Installing segmentation-models-pytorch...")
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "segmentation-models-pytorch"])
+    print("SMP installed successfully!")
+
 import json
 import os
 import time
