@@ -269,19 +269,33 @@ class OrganoidDataset(Dataset):
         target_arr = np.array(target_img, dtype=np.float32) / 255.0
         target_tensor = torch.from_numpy(target_arr).unsqueeze(0)
         
+        # Load mask image (for LB-aligned evaluation)
+        mask_tensor = None
+        if "mask_path" in row and pd.notna(row.get("mask_path", None)):
+            mask_path = self.data_dir / row["mask_path"]
+            if mask_path.exists():
+                mask_img = Image.open(mask_path).convert("L")
+                mask_img = mask_img.resize((self.image_size, self.image_size), Image.NEAREST)
+                mask_arr = np.array(mask_img, dtype=np.float32) / 255.0
+                mask_tensor = torch.from_numpy(mask_arr).unsqueeze(0)
+        
         # Include category for stratified evaluation
         category = row.get("category", "unknown")
         
         # Get sample weight (default 1.0)
         weight = self.sample_weights.get(original_idx, 1.0)
         
-        return {
+        result = {
             "id": row["id"], 
             "input": input_tensor, 
             "target": target_tensor, 
             "category": category,
             "weight": torch.tensor(weight, dtype=torch.float32),
         }
+        if mask_tensor is not None:
+            result["mask"] = mask_tensor
+        
+        return result
 
 
 # ==============================================================================
@@ -444,20 +458,96 @@ def set_seed(seed):
         torch.cuda.manual_seed_all(seed)
 
 
-def calculate_metrics(pred, target):
-    """Calculate SSIM and PSNR for a batch."""
-    pred_np = pred.cpu().numpy()
-    target_np = target.cpu().numpy()
+def calculate_ssim_masked(pred, target, mask, data_range=255):
+    """
+    Calculate SSIM only on masked region (LB-aligned).
+    
+    Args:
+        pred: Predicted image (H, W), uint8
+        target: Ground truth image (H, W), uint8
+        mask: Binary mask (H, W), >0 = evaluate
+        data_range: Max value (255 for uint8)
+    """
+    pred = pred.astype(np.float64)
+    target = target.astype(np.float64)
+    mask_bool = mask > 0
+    
+    if mask_bool.sum() == 0:
+        return 0.0
+    
+    pred_m = pred[mask_bool]
+    target_m = target[mask_bool]
+    
+    C1 = (0.01 * data_range) ** 2
+    C2 = (0.03 * data_range) ** 2
+    
+    mu_p = pred_m.mean()
+    mu_t = target_m.mean()
+    
+    sigma_p_sq = pred_m.var()
+    sigma_t_sq = target_m.var()
+    sigma_pt = ((pred_m - mu_p) * (target_m - mu_t)).mean()
+    
+    ssim_val = ((2 * mu_p * mu_t + C1) * (2 * sigma_pt + C2)) / \
+               ((mu_p**2 + mu_t**2 + C1) * (sigma_p_sq + sigma_t_sq + C2))
+    
+    return float(ssim_val)
+
+
+def calculate_psnr_masked(pred, target, mask, data_range=255):
+    """
+    Calculate PSNR only on masked region (LB-aligned).
+    """
+    pred = pred.astype(np.float64)
+    target = target.astype(np.float64)
+    mask_bool = mask > 0
+    
+    if mask_bool.sum() == 0:
+        return 0.0
+    
+    pred_m = pred[mask_bool]
+    target_m = target[mask_bool]
+    
+    mse = np.mean((pred_m - target_m) ** 2)
+    
+    if mse == 0:
+        return 100.0
+    
+    psnr_val = 10 * np.log10((data_range ** 2) / mse)
+    return float(psnr_val)
+
+
+def calculate_metrics(pred, target, mask=None):
+    """
+    Calculate SSIM and PSNR for a batch (LB-aligned: uint8, data_range=255).
+    
+    Args:
+        pred: Predicted tensor (B, 1, H, W), float [0, 1]
+        target: Target tensor (B, 1, H, W), float [0, 1]
+        mask: Optional mask tensor (B, 1, H, W), binary
+    """
+    # Convert to uint8 [0, 255] for LB-aligned evaluation
+    pred_np = (pred.cpu().numpy() * 255).astype(np.uint8)
+    target_np = (target.cpu().numpy() * 255).astype(np.uint8)
+    
+    if mask is not None:
+        mask_np = (mask.cpu().numpy() > 0.5).astype(np.uint8)
     
     ssim_scores = []
     psnr_scores = []
     
     for i in range(pred_np.shape[0]):
-        p = np.clip(pred_np[i, 0], 0, 1)
-        t = np.clip(target_np[i, 0], 0, 1)
+        p = pred_np[i, 0]
+        t = target_np[i, 0]
         
-        ssim_scores.append(ssim(t, p, data_range=1.0))
-        psnr_scores.append(psnr(t, p, data_range=1.0))
+        if mask is not None and mask_np.shape[0] > i:
+            m = mask_np[i, 0]
+            ssim_scores.append(calculate_ssim_masked(p, t, m, data_range=255))
+            psnr_scores.append(calculate_psnr_masked(p, t, m, data_range=255))
+        else:
+            # Fallback: full image evaluation with data_range=255
+            ssim_scores.append(ssim(t, p, data_range=255))
+            psnr_scores.append(psnr(t, p, data_range=255))
     
     return np.mean(ssim_scores), np.mean(psnr_scores)
 
@@ -528,13 +618,17 @@ def validate(model, loader, criterion, device):
         for batch in tqdm(loader, desc="Validation"):
             inputs = batch["input"].to(device)
             targets = batch["target"].to(device)
+            masks = batch.get("mask", None)
+            if masks is not None:
+                masks = masks.to(device)
             
             outputs = torch.clamp(model(inputs), 0, 1)
             
             loss = criterion(outputs, targets)
             total_loss += loss.item()
             
-            batch_ssim, batch_psnr = calculate_metrics(outputs, targets)
+            # LB-aligned metrics with mask
+            batch_ssim, batch_psnr = calculate_metrics(outputs, targets, masks)
             total_ssim += batch_ssim
             total_psnr += batch_psnr
             n_batches += 1
@@ -563,6 +657,7 @@ def validate_with_categories(model, loader, criterion, device):
             inputs = batch["input"].to(device)
             targets = batch["target"].to(device)
             categories = batch["category"]
+            masks = batch.get("mask", None)
             
             outputs = torch.clamp(model(inputs), 0, 1)
             
@@ -570,16 +665,24 @@ def validate_with_categories(model, loader, criterion, device):
             total_loss += loss.item()
             n_batches += 1
             
-            # Calculate per-sample metrics and group by category
-            pred_np = outputs.cpu().numpy()
-            target_np = targets.cpu().numpy()
+            # Convert to uint8 for LB-aligned evaluation
+            pred_np = (outputs.cpu().numpy() * 255).astype(np.uint8)
+            target_np = (targets.cpu().numpy() * 255).astype(np.uint8)
+            mask_np = None
+            if masks is not None:
+                mask_np = (masks.cpu().numpy() > 0.5).astype(np.uint8)
             
             for i, cat in enumerate(categories):
-                p = np.clip(pred_np[i, 0], 0, 1)
-                t = np.clip(target_np[i, 0], 0, 1)
+                p = pred_np[i, 0]
+                t = target_np[i, 0]
                 
-                s = ssim(t, p, data_range=1.0)
-                pn = psnr(t, p, data_range=1.0)
+                if mask_np is not None and mask_np.shape[0] > i:
+                    m = mask_np[i, 0]
+                    s = calculate_ssim_masked(p, t, m, data_range=255)
+                    pn = calculate_psnr_masked(p, t, m, data_range=255)
+                else:
+                    s = ssim(t, p, data_range=255)
+                    pn = psnr(t, p, data_range=255)
                 
                 if cat in category_metrics:
                     category_metrics[cat]['ssim'].append(s)
