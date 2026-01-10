@@ -57,6 +57,7 @@ class Config:
     # Loss weights
     l1_weight = 1.0
     ssim_weight = 1.0
+    mask_outside_weight = 0.2  # Loss weight for mask-outside region (0 = ignore, 1 = full)
     
     # Model
     encoder = "resnet34"
@@ -447,6 +448,53 @@ class CombinedLoss(nn.Module):
         return self.l1_weight * l1 + self.ssim_weight * ssim
 
 
+class MaskedCombinedLoss(nn.Module):
+    """
+    Combined L1 + SSIM loss with mask-based spatial weighting.
+    
+    Applies different weights to mask-inside and mask-outside regions
+    to improve boundary continuity while focusing on the evaluation region.
+    
+    Args:
+        l1_weight: Weight for L1 loss component
+        ssim_weight: Weight for SSIM loss component
+        inside_weight: Loss weight for mask inside region (default: 1.0)
+        outside_weight: Loss weight for mask outside region (default: 0.2)
+    """
+    def __init__(self, l1_weight=1.0, ssim_weight=1.0, inside_weight=1.0, outside_weight=0.2):
+        super().__init__()
+        self.ssim_loss = SSIMLoss()
+        self.l1_weight = l1_weight
+        self.ssim_weight = ssim_weight
+        self.inside_weight = inside_weight
+        self.outside_weight = outside_weight
+    
+    def forward(self, pred, target, mask=None):
+        """
+        Args:
+            pred: Predicted tensor (B, C, H, W)
+            target: Target tensor (B, C, H, W)
+            mask: Optional mask tensor (B, C, H, W), >0 = inside region
+        """
+        # SSIM loss (always computed on full image for proper windowing)
+        ssim = self.ssim_loss(pred, target)
+        
+        if mask is not None:
+            # Compute spatial weight map: inside=inside_weight, outside=outside_weight
+            mask_binary = (mask > 0.5).float()
+            weight_map = mask_binary * self.inside_weight + (1 - mask_binary) * self.outside_weight
+            
+            # Weighted L1 loss
+            l1_per_pixel = torch.abs(pred - target)
+            weighted_l1 = (l1_per_pixel * weight_map).sum() / weight_map.sum()
+            
+            return self.l1_weight * weighted_l1 + self.ssim_weight * ssim
+        else:
+            # Fallback to standard L1 loss
+            l1 = nn.functional.l1_loss(pred, target)
+            return self.l1_weight * l1 + self.ssim_weight * ssim
+
+
 # ==============================================================================
 # Training
 # ==============================================================================
@@ -553,18 +601,30 @@ def calculate_metrics(pred, target, mask=None):
 
 
 def train_epoch(model, loader, criterion, optimizer, device):
+    """Training epoch with optional mask-based loss weighting."""
     model.train()
     total_loss = 0
+    
+    # Check if criterion supports mask parameter
+    use_mask = isinstance(criterion, MaskedCombinedLoss)
     
     pbar = tqdm(loader, desc="Training")
     for batch in pbar:
         inputs = batch["input"].to(device)
         targets = batch["target"].to(device)
+        masks = batch.get("mask", None)
+        if masks is not None:
+            masks = masks.to(device)
         
         optimizer.zero_grad()
         outputs = torch.clamp(model(inputs), 0, 1)
         
-        loss = criterion(outputs, targets)
+        # Use MaskedCombinedLoss if available, otherwise standard loss
+        if use_mask and masks is not None:
+            loss = criterion(outputs, targets, masks)
+        else:
+            loss = criterion(outputs, targets)
+        
         loss.backward()
         optimizer.step()
         
@@ -768,8 +828,13 @@ def train(config):
     # Model
     model = create_model(config)
     
-    # Loss and optimizer
-    criterion = CombinedLoss(config.l1_weight, config.ssim_weight)
+    # Loss and optimizer (use MaskedCombinedLoss for boundary-aware training)
+    criterion = MaskedCombinedLoss(
+        l1_weight=config.l1_weight, 
+        ssim_weight=config.ssim_weight,
+        inside_weight=1.0,
+        outside_weight=config.mask_outside_weight
+    )
     optimizer = optim.AdamW(
         model.parameters(),
         lr=config.learning_rate,
@@ -904,7 +969,12 @@ def train_kfold(config, n_folds=5):
         # Create fresh model for each fold
         model = create_model(config)
         
-        criterion = CombinedLoss(config.l1_weight, config.ssim_weight)
+        criterion = MaskedCombinedLoss(
+            l1_weight=config.l1_weight, 
+            ssim_weight=config.ssim_weight,
+            inside_weight=1.0,
+            outside_weight=config.mask_outside_weight
+        )
         optimizer = optim.AdamW(
             model.parameters(),
             lr=config.learning_rate,
@@ -1152,7 +1222,12 @@ def train_worst_case_cv(config, n_folds=5):
         # Create fresh model for each fold
         model = create_model(config)
         
-        criterion = CombinedLoss(config.l1_weight, config.ssim_weight)
+        criterion = MaskedCombinedLoss(
+            l1_weight=config.l1_weight, 
+            ssim_weight=config.ssim_weight,
+            inside_weight=1.0,
+            outside_weight=config.mask_outside_weight
+        )
         optimizer = optim.AdamW(
             model.parameters(),
             lr=config.learning_rate,
@@ -1376,7 +1451,12 @@ def train_worst_case_cv_v5(config, n_folds=5):
         
         # Create model
         model = create_model(config)
-        criterion = CombinedLoss(config.l1_weight, config.ssim_weight)
+        criterion = MaskedCombinedLoss(
+            l1_weight=config.l1_weight, 
+            ssim_weight=config.ssim_weight,
+            inside_weight=1.0,
+            outside_weight=config.mask_outside_weight
+        )
         optimizer = optim.AdamW(
             model.parameters(),
             lr=config.learning_rate,
