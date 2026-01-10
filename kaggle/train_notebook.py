@@ -337,7 +337,7 @@ class SimpleUNet(nn.Module):
         d2 = self.dec2(torch.cat([self.up2(d3), e2], dim=1))
         d1 = self.dec1(torch.cat([self.up1(d2), e1], dim=1))
         
-        return self.out_conv(d1)
+        return torch.sigmoid(self.out_conv(d1))  # sigmoid for [0,1] output
 
 
 def create_model(config):
@@ -349,11 +349,12 @@ def create_model(config):
             encoder_weights=config.encoder_weights,
             in_channels=config.in_channels,
             classes=config.out_channels,
+            activation='sigmoid',  # Output in [0,1] range
         )
-        print("Using SMP U-Net with pretrained encoder")
+        print(f"Using SMP U-Net ({config.encoder}) with sigmoid activation")
     except ImportError:
         model = SimpleUNet(config.in_channels, config.out_channels)
-        print("Using Simple U-Net (SMP not available)")
+        print("Using Simple U-Net (SMP not available) with sigmoid activation")
     
     return model.to(config.device)
 
