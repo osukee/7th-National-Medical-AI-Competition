@@ -58,6 +58,7 @@ class Config:
     l1_weight = 1.0
     ssim_weight = 1.0
     mask_outside_weight = 0.2  # Loss weight for mask-outside region (0 = ignore, 1 = full)
+    edge_weight = 0.1  # Weight for edge loss (0.05-0.2 recommended)
     
     # Model
     encoder = "resnet34"
@@ -495,6 +496,105 @@ class MaskedCombinedLoss(nn.Module):
             return self.l1_weight * l1 + self.ssim_weight * ssim
 
 
+class SobelEdgeLoss(nn.Module):
+    """
+    Edge-aware loss using Sobel operators.
+    
+    Purpose: Force model to preserve structure instead of producing blurry averages.
+    Apply to BOTH prediction and GT, compare their edge maps.
+    
+    Key insight: Edge loss should have its own mask strategy (mask + outside_base)
+    because boundaries extend slightly beyond the mask region.
+    """
+    def __init__(self, outside_base=0.3):
+        super().__init__()
+        # Sobel kernels for edge detection
+        sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32)
+        sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.float32)
+        
+        # Register as buffers (move to device with model)
+        self.register_buffer('sobel_x', sobel_x.view(1, 1, 3, 3))
+        self.register_buffer('sobel_y', sobel_y.view(1, 1, 3, 3))
+        self.outside_base = outside_base
+    
+    def _compute_edges(self, x):
+        """Compute edge magnitude from Sobel operators."""
+        # Apply Sobel operators
+        edge_x = nn.functional.conv2d(x, self.sobel_x, padding=1)
+        edge_y = nn.functional.conv2d(x, self.sobel_y, padding=1)
+        # Edge magnitude
+        return torch.sqrt(edge_x ** 2 + edge_y ** 2 + 1e-8)
+    
+    def forward(self, pred, target, mask=None):
+        """
+        Args:
+            pred: Predicted tensor (B, C, H, W)
+            target: Target tensor (B, C, H, W)
+            mask: Optional mask tensor (B, C, H, W)
+        """
+        # Compute edge maps for both pred and GT
+        edge_pred = self._compute_edges(pred)
+        edge_gt = self._compute_edges(target)
+        
+        if mask is not None:
+            # Edge-specific mask: include boundary region (mask + outside_base)
+            # This is different from pixel loss mask!
+            edge_weight = torch.clamp(mask + self.outside_base, 0, 1)
+            
+            # Weighted L1 on edge maps
+            edge_diff = torch.abs(edge_pred - edge_gt)
+            weighted_edge_loss = (edge_diff * edge_weight).sum() / (edge_weight.sum() + 1e-8)
+            return weighted_edge_loss
+        else:
+            # Unmasked edge loss
+            return nn.functional.l1_loss(edge_pred, edge_gt)
+
+
+class EdgeAwareLoss(nn.Module):
+    """
+    Combined loss with separate pixel and edge components.
+    
+    Architecture:
+    - Pixel loss: L1 + SSIM (masked with inside=1.0, outside=0.2)
+    - Edge loss: Sobel L1 (masked with mask + 0.3, different strategy!)
+    
+    Goal: "Stop averaging, preserve structure"
+    
+    Args:
+        l1_weight: Weight for L1 pixel loss
+        ssim_weight: Weight for SSIM loss
+        edge_weight: Weight for edge loss (recommend 0.05-0.2)
+        mask_outside_weight: Weight for pixel loss outside mask
+        edge_outside_base: Base weight for edge loss outside mask
+    """
+    def __init__(self, l1_weight=1.0, ssim_weight=1.0, edge_weight=0.1, 
+                 mask_outside_weight=0.2, edge_outside_base=0.3):
+        super().__init__()
+        self.pixel_loss = MaskedCombinedLoss(
+            l1_weight=l1_weight, 
+            ssim_weight=ssim_weight,
+            inside_weight=1.0,
+            outside_weight=mask_outside_weight
+        )
+        self.edge_loss = SobelEdgeLoss(outside_base=edge_outside_base)
+        self.edge_weight = edge_weight
+    
+    def forward(self, pred, target, mask=None):
+        """
+        Args:
+            pred: Predicted tensor (B, C, H, W)
+            target: Target tensor (B, C, H, W)
+            mask: Optional mask tensor (B, C, H, W)
+        """
+        # Pixel-based loss (L1 + SSIM)
+        loss_pixel = self.pixel_loss(pred, target, mask)
+        
+        # Edge-based loss (Sobel)
+        loss_edge = self.edge_loss(pred, target, mask)
+        
+        return loss_pixel + self.edge_weight * loss_edge
+
+
 # ==============================================================================
 # Training
 # ==============================================================================
@@ -828,12 +928,13 @@ def train(config):
     # Model
     model = create_model(config)
     
-    # Loss and optimizer (use MaskedCombinedLoss for boundary-aware training)
-    criterion = MaskedCombinedLoss(
+    # Loss and optimizer (use EdgeAwareLoss for structure-preserving training)
+    criterion = EdgeAwareLoss(
         l1_weight=config.l1_weight, 
         ssim_weight=config.ssim_weight,
-        inside_weight=1.0,
-        outside_weight=config.mask_outside_weight
+        edge_weight=config.edge_weight,
+        mask_outside_weight=config.mask_outside_weight,
+        edge_outside_base=0.3
     )
     optimizer = optim.AdamW(
         model.parameters(),
@@ -969,11 +1070,12 @@ def train_kfold(config, n_folds=5):
         # Create fresh model for each fold
         model = create_model(config)
         
-        criterion = MaskedCombinedLoss(
+        criterion = EdgeAwareLoss(
             l1_weight=config.l1_weight, 
             ssim_weight=config.ssim_weight,
-            inside_weight=1.0,
-            outside_weight=config.mask_outside_weight
+            edge_weight=config.edge_weight,
+            mask_outside_weight=config.mask_outside_weight,
+            edge_outside_base=0.3
         )
         optimizer = optim.AdamW(
             model.parameters(),
@@ -1222,11 +1324,12 @@ def train_worst_case_cv(config, n_folds=5):
         # Create fresh model for each fold
         model = create_model(config)
         
-        criterion = MaskedCombinedLoss(
+        criterion = EdgeAwareLoss(
             l1_weight=config.l1_weight, 
             ssim_weight=config.ssim_weight,
-            inside_weight=1.0,
-            outside_weight=config.mask_outside_weight
+            edge_weight=config.edge_weight,
+            mask_outside_weight=config.mask_outside_weight,
+            edge_outside_base=0.3
         )
         optimizer = optim.AdamW(
             model.parameters(),
@@ -1451,11 +1554,12 @@ def train_worst_case_cv_v5(config, n_folds=5):
         
         # Create model
         model = create_model(config)
-        criterion = MaskedCombinedLoss(
+        criterion = EdgeAwareLoss(
             l1_weight=config.l1_weight, 
             ssim_weight=config.ssim_weight,
-            inside_weight=1.0,
-            outside_weight=config.mask_outside_weight
+            edge_weight=config.edge_weight,
+            mask_outside_weight=config.mask_outside_weight,
+            edge_outside_base=0.3
         )
         optimizer = optim.AdamW(
             model.parameters(),
