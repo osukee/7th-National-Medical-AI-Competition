@@ -187,7 +187,8 @@ class SimpleUNet(nn.Module):
         d2 = self.dec2(torch.cat([self.up2(d3), e2], dim=1))
         d1 = self.dec1(torch.cat([self.up1(d2), e1], dim=1))
         
-        return self.out_conv(d1)
+        # FIX: Add sigmoid to ensure output is in [0, 1] range
+        return torch.sigmoid(self.out_conv(d1))
 
 
 def create_model(config):
