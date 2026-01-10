@@ -454,6 +454,124 @@ def validate(model, loader, criterion, device):
 
 
 # ==============================================================================
+# DEBUG: Value Range and PSNR Verification
+# ==============================================================================
+
+def debug_value_ranges(config, val_loader, model):
+    """
+    Debug function to verify:
+    1. pred/gt/mask value ranges
+    2. mask pixel counts
+    3. PSNR hand calculation vs metric function
+    """
+    print("\n" + "=" * 60)
+    print("🔍 DEBUG: Value Range and PSNR Verification")
+    print("=" * 60)
+    
+    model.eval()
+    
+    # Get one batch
+    batch = next(iter(val_loader))
+    inputs = batch["input"].to(config.device)
+    targets = batch["target"].to(config.device)
+    masks = batch["mask"].to(config.device)
+    
+    with torch.no_grad():
+        outputs = torch.clamp(model(inputs), 0, 1)
+    
+    # Check shapes
+    print(f"\n📐 Shapes:")
+    print(f"  inputs:  {inputs.shape}")
+    print(f"  targets: {targets.shape}")
+    print(f"  masks:   {masks.shape}")
+    print(f"  outputs: {outputs.shape}")
+    
+    # Check value ranges (on GPU tensors)
+    print(f"\n📊 Value Ranges (tensors, should be 0-1):")
+    print(f"  inputs:  min={inputs.min().item():.4f}, max={inputs.max().item():.4f}, mean={inputs.mean().item():.4f}")
+    print(f"  targets: min={targets.min().item():.4f}, max={targets.max().item():.4f}, mean={targets.mean().item():.4f}")
+    print(f"  outputs: min={outputs.min().item():.4f}, max={outputs.max().item():.4f}, mean={outputs.mean().item():.4f}")
+    print(f"  masks:   min={masks.min().item():.4f}, max={masks.max().item():.4f}, unique={masks.unique().tolist()}")
+    
+    # Mask statistics
+    mask_sum = masks.sum().item()
+    total_pixels = masks.numel()
+    print(f"\n🎭 Mask Statistics:")
+    print(f"  Total pixels: {total_pixels}")
+    print(f"  Masked pixels: {mask_sum} ({mask_sum/total_pixels*100:.1f}%)")
+    
+    # Convert to numpy for PSNR check (first sample only)
+    pred_np = outputs[0, 0].cpu().numpy()
+    gt_np = targets[0, 0].cpu().numpy()
+    mask_np = masks[0, 0].cpu().numpy()
+    
+    print(f"\n🧮 PSNR Hand Calculation (sample 0):")
+    print(f"  pred_np:  min={pred_np.min():.4f}, max={pred_np.max():.4f}")
+    print(f"  gt_np:    min={gt_np.min():.4f}, max={gt_np.max():.4f}")
+    
+    # Method 1: On [0,1] scale, data_range=1.0
+    mask_bool = mask_np > 0.5
+    pred_m = pred_np[mask_bool]
+    gt_m = gt_np[mask_bool]
+    mse_01 = np.mean((pred_m - gt_m) ** 2)
+    psnr_01 = 10 * np.log10(1.0 / mse_01) if mse_01 > 0 else 100
+    print(f"\n  Method 1 (scale 0-1, data_range=1):")
+    print(f"    MSE = {mse_01:.6f}")
+    print(f"    PSNR = {psnr_01:.2f} dB")
+    
+    # Method 2: On [0,255] scale  
+    pred_255 = pred_np * 255
+    gt_255 = gt_np * 255
+    pred_m_255 = pred_255[mask_bool]
+    gt_m_255 = gt_255[mask_bool]
+    mse_255 = np.mean((pred_m_255 - gt_m_255) ** 2)
+    psnr_255 = 10 * np.log10(255**2 / mse_255) if mse_255 > 0 else 100
+    print(f"\n  Method 2 (scale 0-255, data_range=255):")
+    print(f"    MSE = {mse_255:.2f}")
+    print(f"    PSNR = {psnr_255:.2f} dB")
+    
+    # Compare with calculate_metrics_masked
+    metrics = calculate_metrics_masked(outputs[:1], targets[:1], masks[:1])
+    print(f"\n  calculate_metrics_masked result:")
+    print(f"    PSNR = {metrics['psnr']:.2f} dB")
+    print(f"    SSIM = {metrics['ssim']:.4f}")
+    
+    # Check if they match
+    print(f"\n✅ Verification:")
+    if abs(psnr_255 - metrics['psnr']) < 0.1:
+        print(f"  ✓ PSNR calculation matches (diff={abs(psnr_255 - metrics['psnr']):.4f})")
+    else:
+        print(f"  ❌ PSNR MISMATCH! Hand: {psnr_255:.2f}, Func: {metrics['psnr']:.2f}")
+    
+    # Save debug images
+    try:
+        from PIL import Image as PILImage
+        debug_dir = config.output_dir / "debug"
+        debug_dir.mkdir(exist_ok=True)
+        
+        # Save first sample
+        input_save = (inputs[0, 0].cpu().numpy() * 255).astype(np.uint8)
+        pred_save = (outputs[0, 0].cpu().numpy() * 255).astype(np.uint8)
+        gt_save = (targets[0, 0].cpu().numpy() * 255).astype(np.uint8)
+        mask_save = (masks[0, 0].cpu().numpy() * 255).astype(np.uint8)
+        
+        PILImage.fromarray(input_save).save(debug_dir / "sample_input.png")
+        PILImage.fromarray(pred_save).save(debug_dir / "sample_pred.png")
+        PILImage.fromarray(gt_save).save(debug_dir / "sample_gt.png")
+        PILImage.fromarray(mask_save).save(debug_dir / "sample_mask.png")
+        
+        print(f"\n📸 Saved debug images to {debug_dir}")
+        print(f"  sample_input.png: min={input_save.min()}, max={input_save.max()}")
+        print(f"  sample_pred.png:  min={pred_save.min()}, max={pred_save.max()}")
+        print(f"  sample_gt.png:    min={gt_save.min()}, max={gt_save.max()}")
+        print(f"  sample_mask.png:  min={mask_save.min()}, max={mask_save.max()}")
+    except Exception as e:
+        print(f"⚠️ Could not save debug images: {e}")
+    
+    print("=" * 60 + "\n")
+
+
+# ==============================================================================
 # Main Training
 # ==============================================================================
 
@@ -498,6 +616,9 @@ def train_simple(config):
     # Optimizer with cosine schedule
     optimizer = optim.AdamW(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, config.epochs)
+    
+    # DEBUG: Verify value ranges before training
+    debug_value_ranges(config, val_loader, model)
     
     # Training loop
     best_score = 0
