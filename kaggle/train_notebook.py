@@ -48,7 +48,7 @@ class Config:
     out_channels = 1
     
     # Training
-    epochs = 3  # 50→3: ベースライン動作確認用（通過後に増やす）
+    epochs = 15  # SMP U-Net with more epochs for convergence
     batch_size = 8
     learning_rate = 1e-4
     weight_decay = 1e-5
