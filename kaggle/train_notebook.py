@@ -705,8 +705,8 @@ def train_epoch(model, loader, criterion, optimizer, device):
     model.train()
     total_loss = 0
     
-    # Check if criterion supports mask parameter
-    use_mask = isinstance(criterion, MaskedCombinedLoss)
+    # Check if criterion supports mask parameter (EdgeAwareLoss or MaskedCombinedLoss)
+    use_mask = isinstance(criterion, (MaskedCombinedLoss, EdgeAwareLoss))
     
     pbar = tqdm(loader, desc="Training")
     for batch in pbar:
@@ -735,16 +735,25 @@ def train_epoch(model, loader, criterion, optimizer, device):
 
 
 def train_epoch_weighted(model, loader, criterion, optimizer, device):
-    """Training epoch with sample-wise loss weighting for v5."""
+    """Training epoch with sample-wise loss weighting for v5.
+    
+    Supports EdgeAwareLoss by passing masks to criterion.
+    """
     model.train()
     total_loss = 0
     total_weighted_loss = 0
+    
+    # Check if criterion supports mask parameter (EdgeAwareLoss or MaskedCombinedLoss)
+    use_mask = isinstance(criterion, (MaskedCombinedLoss, EdgeAwareLoss))
     
     pbar = tqdm(loader, desc="Training (weighted)")
     for batch in pbar:
         inputs = batch["input"].to(device)
         targets = batch["target"].to(device)
         weights = batch["weight"].to(device)  # Sample weights
+        masks = batch.get("mask", None)
+        if masks is not None:
+            masks = masks.to(device)
         
         optimizer.zero_grad()
         outputs = torch.clamp(model(inputs), 0, 1)
@@ -753,7 +762,11 @@ def train_epoch_weighted(model, loader, criterion, optimizer, device):
         batch_size = inputs.size(0)
         sample_losses = []
         for i in range(batch_size):
-            sample_loss = criterion(outputs[i:i+1], targets[i:i+1])
+            if use_mask and masks is not None:
+                sample_mask = masks[i:i+1]
+                sample_loss = criterion(outputs[i:i+1], targets[i:i+1], sample_mask)
+            else:
+                sample_loss = criterion(outputs[i:i+1], targets[i:i+1])
             sample_losses.append(sample_loss * weights[i])
         
         # Weighted mean loss
