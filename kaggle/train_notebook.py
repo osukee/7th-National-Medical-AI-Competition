@@ -43,7 +43,7 @@ class Config:
     output_dir = Path("/kaggle/working")
     
     # Image
-    image_size = 512
+    image_size = 384  # exp_011: 512 -> 384 for faster training + TTA余地
     in_channels = 1
     out_channels = 1
     
@@ -60,9 +60,10 @@ class Config:
     mask_outside_weight = 0.2  # Loss weight for mask-outside region (0 = ignore, 1 = full)
     edge_weight = 0.1  # Weight for edge loss (0.05-0.2 recommended)
     
-    # Model
-    encoder = "resnet34"
+    # Model - exp_011: Architecture upgrade for high-frequency representation
+    encoder = "efficientnet-b4"  # resnet34 -> efficientnet-b4 (stronger encoder)
     encoder_weights = "imagenet"
+    decoder_attention_type = "scse"  # Add scSE attention to decoder
     
     # Device
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -370,14 +371,21 @@ def create_model(config):
     """Create model, preferring SMP if available."""
     try:
         import segmentation_models_pytorch as smp
+        
+        # Get decoder attention type (default None for no attention)
+        decoder_attention = getattr(config, 'decoder_attention_type', None)
+        
         model = smp.Unet(
             encoder_name=config.encoder,
             encoder_weights=config.encoder_weights,
             in_channels=config.in_channels,
             classes=config.out_channels,
             activation='sigmoid',  # Output in [0,1] range
+            decoder_attention_type=decoder_attention,  # exp_011: scSE attention
         )
-        print(f"Using SMP U-Net ({config.encoder}) with sigmoid activation")
+        
+        attention_str = f" + {decoder_attention} attention" if decoder_attention else ""
+        print(f"Using SMP U-Net ({config.encoder}{attention_str}) with sigmoid activation")
     except ImportError:
         model = SimpleUNet(config.in_channels, config.out_channels)
         print("Using Simple U-Net (SMP not available) with sigmoid activation")
