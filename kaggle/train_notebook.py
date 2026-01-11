@@ -787,6 +787,9 @@ def validate(model, loader, criterion, device):
     total_psnr = 0
     n_batches = 0
     
+    # Check if criterion supports mask parameter (EdgeAwareLoss or MaskedCombinedLoss)
+    use_mask = isinstance(criterion, (MaskedCombinedLoss, EdgeAwareLoss))
+    
     with torch.no_grad():
         for batch in tqdm(loader, desc="Validation"):
             inputs = batch["input"].to(device)
@@ -797,7 +800,11 @@ def validate(model, loader, criterion, device):
             
             outputs = torch.clamp(model(inputs), 0, 1)
             
-            loss = criterion(outputs, targets)
+            # Pass mask to criterion if supported
+            if use_mask and masks is not None:
+                loss = criterion(outputs, targets, masks)
+            else:
+                loss = criterion(outputs, targets)
             total_loss += loss.item()
             
             # LB-aligned metrics with mask
@@ -825,16 +832,25 @@ def validate_with_categories(model, loader, criterion, device):
         'C': {'ssim': [], 'psnr': []},
     }
     
+    # Check if criterion supports mask parameter (EdgeAwareLoss or MaskedCombinedLoss)
+    use_mask = isinstance(criterion, (MaskedCombinedLoss, EdgeAwareLoss))
+    
     with torch.no_grad():
         for batch in tqdm(loader, desc="Validation"):
             inputs = batch["input"].to(device)
             targets = batch["target"].to(device)
             categories = batch["category"]
             masks = batch.get("mask", None)
+            if masks is not None:
+                masks = masks.to(device)
             
             outputs = torch.clamp(model(inputs), 0, 1)
             
-            loss = criterion(outputs, targets)
+            # Pass mask to criterion if supported
+            if use_mask and masks is not None:
+                loss = criterion(outputs, targets, masks)
+            else:
+                loss = criterion(outputs, targets)
             total_loss += loss.item()
             n_batches += 1
             
