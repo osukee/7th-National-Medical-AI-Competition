@@ -43,7 +43,7 @@ class Config:
     output_dir = Path("/kaggle/working")
     
     # Image
-    image_size = 384  # exp_011: 512 -> 384 for faster training + TTA余地
+    image_size = 512  # Back to 512 baseline
     in_channels = 1
     out_channels = 1
     
@@ -60,10 +60,12 @@ class Config:
     mask_outside_weight = 0.2  # Loss weight for mask-outside region (0 = ignore, 1 = full)
     edge_weight = 0.1  # Weight for edge loss (0.05-0.2 recommended)
     
-    # Model - exp_011: Architecture upgrade for high-frequency representation
-    encoder = "efficientnet-b4"  # resnet34 -> efficientnet-b4 (stronger encoder)
+    # Model - Back to resnet34 baseline
+    encoder = "resnet34"
     encoder_weights = "imagenet"
-    decoder_attention_type = "scse"  # Add scSE attention to decoder
+    
+    # exp_013: Distribution analysis settings
+    analyze_distribution = True  # Enable distribution analysis on validation
     
     # Device
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -708,6 +710,107 @@ def calculate_metrics(pred, target, mask=None):
     return np.mean(ssim_scores), np.mean(psnr_scores)
 
 
+def analyze_prediction_distribution(predictions, targets, masks, sample_ids):
+    """
+    Analyze prediction distribution for LB optimization.
+    
+    exp_013: Key diagnostic tool for systematic optimization.
+    
+    Returns dict with:
+    - Global distribution stats
+    - Per-sample stats  
+    - Pred vs Target comparison
+    - Diagnosis for next steps
+    """
+    stats = {
+        'pred_inside': {'means': [], 'stds': []},
+        'target_inside': {'means': [], 'stds': []},
+        'per_sample': [],
+    }
+    
+    all_pred_inside = []
+    all_target_inside = []
+    
+    for pred, target, mask, sid in zip(predictions, targets, masks, sample_ids):
+        mask_bool = mask > 0
+        
+        if mask_bool.sum() == 0:
+            continue
+        
+        pred_inside = pred[mask_bool]
+        target_inside = target[mask_bool]
+        
+        all_pred_inside.extend(pred_inside.tolist())
+        all_target_inside.extend(target_inside.tolist())
+        
+        sample_stat = {
+            'id': sid,
+            'pred_mean': float(pred_inside.mean()),
+            'pred_std': float(pred_inside.std()),
+            'target_mean': float(target_inside.mean()),
+            'target_std': float(target_inside.std()),
+            'mean_diff': float(pred_inside.mean() - target_inside.mean()),
+        }
+        stats['per_sample'].append(sample_stat)
+        stats['pred_inside']['means'].append(sample_stat['pred_mean'])
+        stats['pred_inside']['stds'].append(sample_stat['pred_std'])
+        stats['target_inside']['means'].append(sample_stat['target_mean'])
+        stats['target_inside']['stds'].append(sample_stat['target_std'])
+    
+    # Global stats
+    all_pred = np.array(all_pred_inside)
+    all_target = np.array(all_target_inside)
+    
+    stats['global'] = {
+        'pred_mean': float(all_pred.mean()) if len(all_pred) > 0 else 0,
+        'pred_std': float(all_pred.std()) if len(all_pred) > 0 else 0,
+        'target_mean': float(all_target.mean()) if len(all_target) > 0 else 0,
+        'target_std': float(all_target.std()) if len(all_target) > 0 else 0,
+        'mean_diff': float(all_pred.mean() - all_target.mean()) if len(all_pred) > 0 else 0,
+        'std_ratio': float(all_pred.std() / all_target.std()) if len(all_target) > 0 and all_target.std() > 0 else 1,
+        'sample_mean_variance': float(np.std(stats['pred_inside']['means'])) if len(stats['pred_inside']['means']) > 0 else 0,
+    }
+    
+    return stats
+
+
+def print_distribution_analysis(stats):
+    """Print distribution analysis summary."""
+    print(f"\n{'='*60}")
+    print("Distribution Analysis (exp_013)")
+    print(f"{'='*60}")
+    
+    g = stats['global']
+    print(f"\nGlobal Stats (mask-inside pixels):")
+    print(f"  Pred:   mean={g['pred_mean']:.1f}, std={g['pred_std']:.1f}")
+    print(f"  Target: mean={g['target_mean']:.1f}, std={g['target_std']:.1f}")
+    print(f"  Mean diff: {g['mean_diff']:.1f}")
+    print(f"  Std ratio: {g['std_ratio']:.3f}")
+    print(f"  Sample-to-sample variance: {g['sample_mean_variance']:.1f}")
+    
+    print(f"\n--- Diagnosis ---")
+    
+    # Mean偏移チェック
+    if abs(g['mean_diff']) > 10:
+        print(f"⚠️ Mean偏移が大きい ({g['mean_diff']:.1f}) → 分布正規化(mean matching)推奨")
+    else:
+        print(f"✅ Mean偏移は許容範囲 ({g['mean_diff']:.1f})")
+    
+    # Std比チェック
+    if abs(g['std_ratio'] - 1) > 0.2:
+        print(f"⚠️ Std比が不均衡 ({g['std_ratio']:.3f}) → コントラスト調整推奨")
+    else:
+        print(f"✅ Std比は許容範囲 ({g['std_ratio']:.3f})")
+    
+    # Sample間ばらつきチェック
+    if g['sample_mean_variance'] > 20:
+        print(f"⚠️ Sample間のばらつきが大きい ({g['sample_mean_variance']:.1f}) → 分布安定化が必要")
+    else:
+        print(f"✅ Sample間のばらつきは許容範囲 ({g['sample_mean_variance']:.1f})")
+    
+    print(f"{'='*60}")
+
+
 def train_epoch(model, loader, criterion, optimizer, device):
     """Training epoch with optional mask-based loss weighting."""
     model.train()
@@ -828,8 +931,8 @@ def validate(model, loader, criterion, device):
     }
 
 
-def validate_with_categories(model, loader, criterion, device):
-    """Validation with category-wise metrics."""
+def validate_with_categories(model, loader, criterion, device, config=None):
+    """Validation with category-wise metrics and distribution analysis."""
     model.eval()
     total_loss = 0
     n_batches = 0
@@ -840,6 +943,10 @@ def validate_with_categories(model, loader, criterion, device):
         'C': {'ssim': [], 'psnr': []},
     }
     
+    # exp_013: Distribution analysis data
+    analyze_dist = config is not None and getattr(config, 'analyze_distribution', False)
+    dist_data = {'predictions': [], 'targets': [], 'masks': [], 'sample_ids': []}
+    
     # Check if criterion supports mask parameter (EdgeAwareLoss or MaskedCombinedLoss)
     use_mask = isinstance(criterion, (MaskedCombinedLoss, EdgeAwareLoss))
     
@@ -848,6 +955,7 @@ def validate_with_categories(model, loader, criterion, device):
             inputs = batch["input"].to(device)
             targets = batch["target"].to(device)
             categories = batch["category"]
+            sample_ids = batch.get("id", [f"sample_{i}" for i in range(len(categories))])
             masks = batch.get("mask", None)
             if masks is not None:
                 masks = masks.to(device)
@@ -872,9 +980,9 @@ def validate_with_categories(model, loader, criterion, device):
             for i, cat in enumerate(categories):
                 p = pred_np[i, 0]
                 t = target_np[i, 0]
+                m = mask_np[i, 0] if mask_np is not None and mask_np.shape[0] > i else None
                 
-                if mask_np is not None and mask_np.shape[0] > i:
-                    m = mask_np[i, 0]
+                if m is not None:
                     s = calculate_ssim_masked(p, t, m, data_range=255)
                     pn = calculate_psnr_masked(p, t, m, data_range=255)
                 else:
@@ -884,6 +992,13 @@ def validate_with_categories(model, loader, criterion, device):
                 if cat in category_metrics:
                     category_metrics[cat]['ssim'].append(s)
                     category_metrics[cat]['psnr'].append(pn)
+                
+                # exp_013: Collect distribution data
+                if analyze_dist and m is not None:
+                    dist_data['predictions'].append(p)
+                    dist_data['targets'].append(t)
+                    dist_data['masks'].append(m)
+                    dist_data['sample_ids'].append(sample_ids[i] if i < len(sample_ids) else f"sample_{i}")
     
     # Compute category-wise means
     results = {"loss": total_loss / n_batches}
@@ -913,6 +1028,17 @@ def validate_with_categories(model, loader, criterion, device):
     
     results['ssim'] = float(np.mean(valid_ssim)) if valid_ssim else 0.0
     results['psnr'] = float(np.mean(valid_psnr)) if valid_psnr else 0.0
+    
+    # exp_013: Run distribution analysis
+    if analyze_dist and len(dist_data['predictions']) > 0:
+        dist_stats = analyze_prediction_distribution(
+            dist_data['predictions'],
+            dist_data['targets'],
+            dist_data['masks'],
+            dist_data['sample_ids']
+        )
+        print_distribution_analysis(dist_stats)
+        results['distribution'] = dist_stats['global']
     
     return results
 
@@ -1128,7 +1254,7 @@ def train_kfold(config, n_folds=5):
             print(f"\nFold {fold+1} - Epoch {epoch + 1}/{config.epochs}")
             
             train_loss = train_epoch(model, train_loader, criterion, optimizer, config.device)
-            val_metrics = validate_with_categories(model, val_loader, criterion, config.device)
+            val_metrics = validate_with_categories(model, val_loader, criterion, config.device, config)
             
             scheduler.step()
             
@@ -1142,7 +1268,7 @@ def train_kfold(config, n_folds=5):
                 torch.save(model.state_dict(), config.output_dir / f"best_model_fold{fold}.pth")
         
         # Store fold results
-        final_metrics = validate_with_categories(model, val_loader, criterion, config.device)
+        final_metrics = validate_with_categories(model, val_loader, criterion, config.device, config)
         fold_results.append({
             'fold': fold + 1,
             'ssim': final_metrics['ssim'],
@@ -1382,7 +1508,7 @@ def train_worst_case_cv(config, n_folds=5):
             print(f"\nFold {fold+1} - Epoch {epoch + 1}/{config.epochs}")
             
             train_loss = train_epoch(model, train_loader, criterion, optimizer, config.device)
-            val_metrics = validate_with_categories(model, val_loader, criterion, config.device)
+            val_metrics = validate_with_categories(model, val_loader, criterion, config.device, config)
             
             # Evaluate worst_val (the key metric)
             worst_val_metrics = validate_worst_val(
@@ -1402,7 +1528,7 @@ def train_worst_case_cv(config, n_folds=5):
                 torch.save(model.state_dict(), config.output_dir / f"best_model_fold{fold}.pth")
         
         # Store fold results
-        final_val_metrics = validate_with_categories(model, val_loader, criterion, config.device)
+        final_val_metrics = validate_with_categories(model, val_loader, criterion, config.device, config)
         final_worst_val = validate_worst_val(
             model, df, worst_val_idx, config.data_dir, config.device, config.image_size
         )
@@ -1612,7 +1738,7 @@ def train_worst_case_cv_v5(config, n_folds=5):
             
             # Use weighted training
             train_loss = train_epoch_weighted(model, train_loader, criterion, optimizer, config.device)
-            val_metrics = validate_with_categories(model, val_loader, criterion, config.device)
+            val_metrics = validate_with_categories(model, val_loader, criterion, config.device, config)
             
             # Evaluate on worst_eval (fixed set)
             worst_eval_metrics = validate_worst_val(
@@ -1631,7 +1757,7 @@ def train_worst_case_cv_v5(config, n_folds=5):
                 torch.save(model.state_dict(), config.output_dir / f"best_model_fold{fold}.pth")
         
         # Store results
-        final_val = validate_with_categories(model, val_loader, criterion, config.device)
+        final_val = validate_with_categories(model, val_loader, criterion, config.device, config)
         final_worst_eval = validate_worst_val(
             model, df, worst_eval_idx, config.data_dir, config.device, config.image_size
         )
