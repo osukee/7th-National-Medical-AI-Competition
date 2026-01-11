@@ -964,7 +964,7 @@ def train(config):
         edge_weight=config.edge_weight,
         mask_outside_weight=config.mask_outside_weight,
         edge_outside_base=0.3
-    )
+    ).to(config.device)  # Move to GPU for Sobel buffers
     optimizer = optim.AdamW(
         model.parameters(),
         lr=config.learning_rate,
@@ -1105,7 +1105,7 @@ def train_kfold(config, n_folds=5):
             edge_weight=config.edge_weight,
             mask_outside_weight=config.mask_outside_weight,
             edge_outside_base=0.3
-        )
+        ).to(config.device)  # Move to GPU for Sobel buffers
         optimizer = optim.AdamW(
             model.parameters(),
             lr=config.learning_rate,
@@ -1359,7 +1359,7 @@ def train_worst_case_cv(config, n_folds=5):
             edge_weight=config.edge_weight,
             mask_outside_weight=config.mask_outside_weight,
             edge_outside_base=0.3
-        )
+        ).to(config.device)  # Move to GPU for Sobel buffers
         optimizer = optim.AdamW(
             model.parameters(),
             lr=config.learning_rate,
@@ -1589,7 +1589,7 @@ def train_worst_case_cv_v5(config, n_folds=5):
             edge_weight=config.edge_weight,
             mask_outside_weight=config.mask_outside_weight,
             edge_outside_base=0.3
-        )
+        ).to(config.device)  # Move to GPU for Sobel buffers
         optimizer = optim.AdamW(
             model.parameters(),
             lr=config.learning_rate,
