@@ -11,6 +11,7 @@ try:
 except ImportError:
     print("Installing segmentation-models-pytorch...")
     subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "segmentation-models-pytorch"])
+    import segmentation_models_pytorch  # Re-import after install
     print("SMP installed successfully!")
 
 import json
