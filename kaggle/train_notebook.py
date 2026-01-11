@@ -35,7 +35,6 @@ from tqdm import tqdm
 # ==============================================================================
 # Configuration
 # ==============================================================================
-
 class Config:
     # Kaggle paths
     data_dir = Path("/kaggle/input/medical-ai-contest-7th-2025")
@@ -67,6 +66,12 @@ class Config:
     
     # exp_013: Distribution analysis settings
     analyze_distribution = True  # Enable distribution analysis on validation
+    
+    # exp_014: Mean Matching settings
+    # From exp_013 distribution analysis: pred_mean=139.2, target_mean=155.3
+    # Δ = target_mean - pred_mean = +16.1
+    mean_matching_enabled = True  # Apply global mean offset to predictions
+    mean_matching_delta = 16.1    # Global offset to add to predictions (target - pred)
     
     # Device
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -1928,6 +1933,13 @@ def predict_and_submit(config, model_path=None):
                 if pred_uint8.shape != (512, 512):
                     print(f"Resizing from {pred_uint8.shape} to (512, 512)")
                     pred_uint8 = cv2.resize(pred_uint8, (512, 512))
+                
+                # exp_014: Apply global mean matching
+                # From distribution analysis: predictions are -16.1 darker than targets on average
+                if getattr(config, 'mean_matching_enabled', False):
+                    delta = getattr(config, 'mean_matching_delta', 0.0)
+                    pred_float = pred_uint8.astype(np.float32) + delta
+                    pred_uint8 = np.clip(pred_float, 0, 255).astype(np.uint8)
                 
                 # Flatten to 1D (262,144 pixels) - Row-major ('C') order
                 pixels_flat = pred_uint8.flatten()
