@@ -80,6 +80,46 @@ class Config:
     seed = 42
 
 # ==============================================================================
+# Excluded Samples (all-zero target images)
+# ==============================================================================
+# These 4 training samples have organoids not properly visible in transmission
+# images, resulting in all-zero target fluorescence images.
+# They should be excluded from training as they add noise to the loss.
+EXCLUDED_SAMPLE_IDS = {
+    'train_00099',
+    'train_00603', 
+    'train_00802',
+    'train_00863'
+}
+
+
+def filter_excluded_samples(df):
+    """Remove samples with all-zero targets from dataframe."""
+    before_count = len(df)
+    df_filtered = df[~df['id'].isin(EXCLUDED_SAMPLE_IDS)]
+    after_count = len(df_filtered)
+    excluded = before_count - after_count
+    if excluded > 0:
+        print(f"Excluded {excluded} samples with all-zero targets: {EXCLUDED_SAMPLE_IDS}")
+    return df_filtered
+
+
+def calculate_lb_score(ssim_val, psnr_val):
+    """
+    Calculate LB score using official Kaggle formula.
+    
+    Score = (SSIM + PSNR_norm) / 2
+    
+    Where:
+    - SSIM: 0-1 range
+    - PSNR_norm = clip((PSNR - 15) / 20, 0, 1)
+      - 15 dB → 0.0
+      - 35 dB → 1.0
+    """
+    psnr_norm = np.clip((psnr_val - 15) / 20, 0, 1)
+    return (ssim_val + psnr_norm) / 2
+
+# ==============================================================================
 # Dark Ratio Computation (Continuous, No Clustering)
 # ==============================================================================
 
@@ -1192,8 +1232,9 @@ def train_kfold(config, n_folds=5):
     print(f"Epochs per fold: {config.epochs}")
     print(f"Batch size: {config.batch_size}")
     
-    # Load full dataframe
+    # Load full dataframe and exclude problematic samples
     df = pd.read_csv(config.train_csv)
+    df = filter_excluded_samples(df)
     print(f"Total samples: {len(df)}")
     print(f"Category distribution: {df['category'].value_counts().to_dict()}")
     
@@ -1429,8 +1470,9 @@ def train_worst_case_cv(config, n_folds=5):
     print(f"Epochs per fold: {config.epochs}")
     print(f"Batch size: {config.batch_size}")
     
-    # Load full dataframe
+    # Load full dataframe and exclude problematic samples
     df = pd.read_csv(config.train_csv)
+    df = filter_excluded_samples(df)
     print(f"Total samples: {len(df)}")
     print(f"Category distribution: {df['category'].value_counts().to_dict()}")
     
@@ -1655,8 +1697,9 @@ def train_worst_case_cv_v5(config, n_folds=5):
     print(f"Device: {config.device}")
     print(f"Epochs per fold: {config.epochs}")
     
-    # Load full dataframe
+    # Load full dataframe and exclude problematic samples
     df = pd.read_csv(config.train_csv)
+    df = filter_excluded_samples(df)
     print(f"Total samples: {len(df)}")
     
     # Create v5 splits

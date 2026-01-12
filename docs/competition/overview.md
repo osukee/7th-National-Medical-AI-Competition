@@ -23,21 +23,32 @@
 
 ## 2. 評価指標
 
-| 指標 | 役割 | 値域 | 目標方向 |
-|------|------|------|----------|
-| **SSIM** | 主指標 | 0.0 〜 1.0 | 高いほど良い |
-| **PSNR** | 補助指標 | 0 〜 ∞ dB | 高いほど良い |
+### 最終スコア（LB Score）
 
-### 計算式
+$$Score = \frac{SSIM + PSNR_{norm}}{2}$$
 
-**SSIM (Structural Similarity Index)**:
+| 成分 | 計算式 | 値域 |
+|------|--------|------|
+| **SSIM** | 構造的類似度（mask内で計算） | 0.0 〜 1.0 |
+| **PSNR** | $20 \times \log_{10}(255 / \sqrt{MSE})$ | dB単位 |
+| **PSNR_norm** | $\text{clip}((PSNR - 15) / 20, 0, 1)$ | 0.0 〜 1.0 |
+
+> [!IMPORTANT]
+> - **PSNR 15 dB → norm 0.0**
+> - **PSNR 35 dB → norm 1.0**
+> - 評価は**マスク領域内**で行われる（data_range=255）
+
+### SSIM 詳細
+
 ```
 SSIM(x,y) = (2μxμy + C1)(2σxy + C2) / ((μx² + μy² + C1)(σx² + σy² + C2))
+C1 = (0.01 × 255)², C2 = (0.03 × 255)²
 ```
 
-**PSNR (Peak Signal-to-Noise Ratio)**:
+### PSNR 詳細
+
 ```
-PSNR = 10 × log10(MAX² / MSE)
+PSNR = 20 × log10(255 / √MSE)  [dB]
 ```
 
 ---
