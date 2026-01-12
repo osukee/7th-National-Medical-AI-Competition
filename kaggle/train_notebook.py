@@ -60,18 +60,18 @@ class Config:
     mask_outside_weight = 0.2  # Loss weight for mask-outside region (0 = ignore, 1 = full)
     edge_weight = 0.1  # Weight for edge loss (0.05-0.2 recommended)
     
-    # Model - Back to resnet34 baseline
-    encoder = "resnet34"
+    # Model - exp_016: Upgrade to efficientnet-b4 for better feature extraction
+    encoder = "efficientnet-b4"
     encoder_weights = "imagenet"
     
     # exp_013: Distribution analysis settings
     analyze_distribution = True  # Enable distribution analysis on validation
     
-    # exp_014: Mean Matching settings
-    # From exp_013 distribution analysis: pred_mean=139.2, target_mean=155.3
-    # Δ = target_mean - pred_mean = +16.1
-    mean_matching_enabled = True  # Apply global mean offset to predictions
-    mean_matching_delta = 16.1    # Global offset to add to predictions (target - pred)
+    # exp_016: Mean Matching DISABLED - exp_015 showed it hurts LB
+    # Previous exp_014/015: mean_matching_enabled=True, delta=16.1
+    # Result: LB 0.407 (same as 0.410 baseline → no improvement)
+    mean_matching_enabled = False  # Disabled for exp_016
+    mean_matching_delta = 0.0      # Not used
     
     # Device
     device = "cuda" if torch.cuda.is_available() else "cpu"
