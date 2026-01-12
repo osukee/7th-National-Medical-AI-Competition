@@ -47,18 +47,18 @@ class Config:
     in_channels = 1
     out_channels = 1
     
-    # Training
-    epochs = 15  # SMP U-Net with more epochs for convergence
+    # Training - exp_017: More epochs for better convergence
+    epochs = 20  # Increased from 15 for loss optimization experiment
     batch_size = 8
     learning_rate = 1e-4
     weight_decay = 1e-5
     num_workers = 2
     
-    # Loss weights
+    # Loss weights - exp_017: Increased SSIM and edge weights for structure preservation
     l1_weight = 1.0
-    ssim_weight = 1.0
+    ssim_weight = 1.5  # Increased from 1.0 - prioritize structure over pixel accuracy
     mask_outside_weight = 0.2  # Loss weight for mask-outside region (0 = ignore, 1 = full)
-    edge_weight = 0.1  # Weight for edge loss (0.05-0.2 recommended)
+    edge_weight = 0.2  # Increased from 0.1 - stronger edge preservation
     
     # Model - exp_016: Upgrade to efficientnet-b4 for better feature extraction
     encoder = "efficientnet-b4"
