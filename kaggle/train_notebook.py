@@ -94,9 +94,13 @@ EXCLUDED_SAMPLE_IDS = {
 
 
 def filter_excluded_samples(df):
-    """Remove samples with all-zero targets from dataframe."""
+    """Remove samples with all-zero targets from dataframe.
+    
+    IMPORTANT: Returns df with reset_index to avoid KeyError in downstream 
+    functions that use df.index for splitting (e.g., create_worst_case_splits).
+    """
     before_count = len(df)
-    df_filtered = df[~df['id'].isin(EXCLUDED_SAMPLE_IDS)]
+    df_filtered = df[~df['id'].isin(EXCLUDED_SAMPLE_IDS)].reset_index(drop=True)
     after_count = len(df_filtered)
     excluded = before_count - after_count
     if excluded > 0:
