@@ -56,7 +56,7 @@ class Config:
     
     # Loss weights (for EdgeAwareLoss - backward compat)
     l1_weight = 1.0
-    ssim_weight = 1.0
+    ssim_weight = 1.5  # exp_017f: Increase from 1.0 to 1.5 for stronger SSIM focus
     mask_outside_weight = 0.2  # Loss weight for mask-outside region (0 = ignore, 1 = full)
     edge_weight = 0.1  # Weight for edge loss (0.05-0.2 recommended)
     
