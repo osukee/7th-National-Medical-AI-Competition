@@ -1,6 +1,6 @@
 # exp_018: Test Time Augmentation (TTA)
 
-> 実施日: 2026-01-13
+> 実施日: 2026-01-14
 
 ## 仮説
 
@@ -17,14 +17,31 @@
 
 1. Original
 2. Horizontal flip → 予測 → flip back
-3. Vertical flip → 予測 → flip back
+3. Vertical flip → 予測 → flip back  
 4. Both flips → 予測 → flip back
 5. 4つの平均を最終予測
 
-## 期待効果
+## 結果 🎉 成功！
 
-- LB Score: +0.01~0.02 (0.43+ 目標)
+| Metric | exp_016 | exp_018 | 変化 |
+|--------|---------|---------|------|
+| **🎯 LB Score** | 0.419 | **0.428** | **+0.009** ✅ |
+| SSIM (CV) | 0.703 | 0.704 | ≈0 |
+| PSNR (CV) | 15.47 | 15.49 | ≈0 |
 
-## 結果
+## 考察
 
-*実行待ち*
+- **TTAは明確に有効** (+0.009 LB)
+- CVはほぼ変化なし → TTAの効果は推論時の安定化
+- 4-way augmentationで十分な効果
+
+## 累積進捗
+
+| 実験 | 変更 | LB | 増分 |
+|------|------|-----|------|
+| exp_015 | Baseline Fix | 0.407 | - |
+| exp_016 | efficientnet-b4 | 0.419 | +0.012 |
+| exp_017 | Loss weight | 0.413 | ❌ |
+| **exp_018** | **TTA** | **0.428** | **+0.009** |
+
+**目標0.46まで残り: +0.032**

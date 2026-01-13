@@ -54,15 +54,30 @@ class Config:
     weight_decay = 1e-5
     num_workers = 2
     
-    # Loss weights
+    # Loss weights (for EdgeAwareLoss - backward compat)
     l1_weight = 1.0
     ssim_weight = 1.0
     mask_outside_weight = 0.2  # Loss weight for mask-outside region (0 = ignore, 1 = full)
     edge_weight = 0.1  # Weight for edge loss (0.05-0.2 recommended)
     
+    # OptimizedLoss weights (for grid search experiments)
+    # Loss = α*L1 + β*(1-SSIM) + γ*GradLoss + δ*TV
+    grad_weight = 0.5     # γ: gradient/edge preservation (0.2-1.0)
+    tv_weight = 1e-4      # δ: total variation for noise (1e-4 to 1e-3)
+    lambda_edge = 2.0     # Edge weighting multiplier for EdgeWeightedLoss
+    
+    # Loss function selection
+    # Options: "combined", "masked", "edge_aware", "optimized", "edge_weighted"
+    # exp_017e: Use OptimizedLoss with β=1.0, γ=0.5 (recommended starting point)
+    loss_type = "optimized"
+    
     # Model - exp_016: Upgrade to efficientnet-b4 for better feature extraction
     encoder = "efficientnet-b4"
     encoder_weights = "imagenet"
+    
+    # Architecture selection
+    # Options: "unet", "unetplusplus" (U-Net++)
+    architecture = "unet"
     
     # exp_013: Distribution analysis settings
     analyze_distribution = True  # Enable distribution analysis on validation
@@ -76,6 +91,11 @@ class Config:
     # exp_018: Test Time Augmentation (TTA)
     # Predict with original + horizontal flip + vertical flip + both, average results
     tta_enabled = True  # Enable TTA for inference
+    
+    # Post-processing options (Phase A quick wins)
+    median_filter_size = 0    # 0=disabled, 3=3x3 median (salt-pepper removal)
+    unsharp_strength = 0.0    # 0=disabled, 0.5=recommended (edge enhancement)
+    unsharp_radius = 1        # Radius for unsharp mask
     
     # Device
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -424,24 +444,45 @@ class SimpleUNet(nn.Module):
 
 
 def create_model(config):
-    """Create model, preferring SMP if available."""
+    """Create model, preferring SMP if available.
+    
+    Supports:
+    - config.architecture = "unet" (default)
+    - config.architecture = "unetplusplus" (U-Net++)
+    - config.decoder_attention_type = "scse" (optional attention)
+    """
     try:
         import segmentation_models_pytorch as smp
         
         # Get decoder attention type (default None for no attention)
         decoder_attention = getattr(config, 'decoder_attention_type', None)
         
-        model = smp.Unet(
-            encoder_name=config.encoder,
-            encoder_weights=config.encoder_weights,
-            in_channels=config.in_channels,
-            classes=config.out_channels,
-            activation='sigmoid',  # Output in [0,1] range
-            decoder_attention_type=decoder_attention,  # exp_011: scSE attention
-        )
+        # Get architecture type (default to unet)
+        arch = getattr(config, 'architecture', 'unet')
+        
+        if arch == 'unetplusplus':
+            model = smp.UnetPlusPlus(
+                encoder_name=config.encoder,
+                encoder_weights=config.encoder_weights,
+                in_channels=config.in_channels,
+                classes=config.out_channels,
+                activation='sigmoid',  # Output in [0,1] range
+                decoder_attention_type=decoder_attention,
+            )
+            arch_name = "U-Net++"
+        else:
+            model = smp.Unet(
+                encoder_name=config.encoder,
+                encoder_weights=config.encoder_weights,
+                in_channels=config.in_channels,
+                classes=config.out_channels,
+                activation='sigmoid',  # Output in [0,1] range
+                decoder_attention_type=decoder_attention,
+            )
+            arch_name = "U-Net"
         
         attention_str = f" + {decoder_attention} attention" if decoder_attention else ""
-        print(f"Using SMP U-Net ({config.encoder}{attention_str}) with sigmoid activation")
+        print(f"Using SMP {arch_name} ({config.encoder}{attention_str}) with sigmoid activation")
     except ImportError:
         model = SimpleUNet(config.in_channels, config.out_channels)
         print("Using Simple U-Net (SMP not available) with sigmoid activation")
@@ -659,6 +700,172 @@ class EdgeAwareLoss(nn.Module):
         return loss_pixel + self.edge_weight * loss_edge
 
 
+class TVLoss(nn.Module):
+    """
+    Total Variation Loss for noise suppression.
+    
+    Encourages spatial smoothness by penalizing differences between
+    adjacent pixels. Helps reduce salt-and-pepper noise and artifacts.
+    
+    TV = mean(|I(x+1,y) - I(x,y)|) + mean(|I(x,y+1) - I(x,y)|)
+    """
+    def __init__(self):
+        super().__init__()
+    
+    def forward(self, x, mask=None):
+        """
+        Args:
+            x: Input tensor (B, C, H, W)
+            mask: Optional mask tensor (B, C, H, W), >0 = evaluate
+        """
+        # Horizontal differences
+        h_diff = torch.abs(x[:, :, :, 1:] - x[:, :, :, :-1])
+        # Vertical differences
+        v_diff = torch.abs(x[:, :, 1:, :] - x[:, :, :-1, :])
+        
+        if mask is not None:
+            # Apply mask to differences
+            h_mask = mask[:, :, :, 1:]  # Align with h_diff
+            v_mask = mask[:, :, 1:, :]  # Align with v_diff
+            
+            h_loss = (h_diff * h_mask).sum() / (h_mask.sum() + 1e-8)
+            v_loss = (v_diff * v_mask).sum() / (v_mask.sum() + 1e-8)
+        else:
+            h_loss = h_diff.mean()
+            v_loss = v_diff.mean()
+        
+        return h_loss + v_loss
+
+
+class OptimizedLoss(nn.Module):
+    """
+    Optimized combined loss for competition.
+    
+    Loss = α * L1 + β * (1-SSIM) + γ * GradLoss + δ * TV
+    
+    Recommended starting values:
+    - l1_weight (α) = 1.0
+    - ssim_weight (β) = 1.0 → increase to 1.5-2.0 for SSIM focus
+    - grad_weight (γ) = 0.5 → edge preservation
+    - tv_weight (δ) = 1e-4 → noise suppression (very small)
+    
+    For grid search experiments:
+    - β = [0.5, 1.0, 1.5]
+    - γ = [0.2, 0.5, 1.0]
+    """
+    def __init__(self, l1_weight=1.0, ssim_weight=1.0, grad_weight=0.5, 
+                 tv_weight=1e-4, mask_outside_weight=0.2):
+        super().__init__()
+        self.ssim_loss = SSIMLoss()
+        self.edge_loss = SobelEdgeLoss(outside_base=0.3)
+        self.tv_loss = TVLoss()
+        
+        self.l1_weight = l1_weight
+        self.ssim_weight = ssim_weight
+        self.grad_weight = grad_weight
+        self.tv_weight = tv_weight
+        self.mask_outside_weight = mask_outside_weight
+    
+    def forward(self, pred, target, mask=None):
+        """
+        Args:
+            pred: Predicted tensor (B, C, H, W)
+            target: Target tensor (B, C, H, W)
+            mask: Optional mask tensor (B, C, H, W)
+        """
+        # 1. L1 Loss (with mask weighting)
+        if mask is not None:
+            mask_binary = (mask > 0.5).float()
+            weight_map = mask_binary * 1.0 + (1 - mask_binary) * self.mask_outside_weight
+            l1_per_pixel = torch.abs(pred - target)
+            loss_l1 = (l1_per_pixel * weight_map).sum() / weight_map.sum()
+        else:
+            loss_l1 = nn.functional.l1_loss(pred, target)
+        
+        # 2. SSIM Loss
+        loss_ssim = self.ssim_loss(pred, target)
+        
+        # 3. Gradient Loss (edge preservation)
+        loss_grad = self.edge_loss(pred, target, mask)
+        
+        # 4. TV Loss (noise suppression)
+        loss_tv = self.tv_loss(pred, mask)
+        
+        # Combined
+        total_loss = (
+            self.l1_weight * loss_l1 +
+            self.ssim_weight * loss_ssim +
+            self.grad_weight * loss_grad +
+            self.tv_weight * loss_tv
+        )
+        
+        return total_loss
+
+
+class EdgeWeightedLoss(nn.Module):
+    """
+    Per-pixel edge-weighted loss.
+    
+    Weights the base loss by edge magnitude:
+        loss_pixel * (1 + λ * normalized_edge_map(input))
+    
+    This forces the model to pay more attention to edge regions,
+    which is critical for SSIM improvement.
+    
+    Args:
+        base_loss: Base loss module (e.g., OptimizedLoss)
+        lambda_edge: Edge weighting multiplier (recommend 2.0)
+    """
+    def __init__(self, base_loss, lambda_edge=2.0):
+        super().__init__()
+        self.base_loss = base_loss
+        self.lambda_edge = lambda_edge
+        
+        # Sobel kernels for edge detection
+        sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32)
+        sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.float32)
+        self.register_buffer('sobel_x', sobel_x.view(1, 1, 3, 3))
+        self.register_buffer('sobel_y', sobel_y.view(1, 1, 3, 3))
+    
+    def _compute_edge_weight(self, x):
+        """Compute normalized edge weight map."""
+        edge_x = nn.functional.conv2d(x, self.sobel_x, padding=1)
+        edge_y = nn.functional.conv2d(x, self.sobel_y, padding=1)
+        edge_mag = torch.sqrt(edge_x ** 2 + edge_y ** 2 + 1e-8)
+        
+        # Normalize to [0, 1]
+        edge_norm = edge_mag / (edge_mag.max() + 1e-8)
+        
+        # Weight: 1 + λ * edge_norm
+        return 1 + self.lambda_edge * edge_norm
+    
+    def forward(self, pred, target, mask=None, input_img=None):
+        """
+        Args:
+            pred: Predicted tensor (B, C, H, W)
+            target: Target tensor (B, C, H, W)
+            mask: Optional mask tensor (B, C, H, W)
+            input_img: Input image for edge weight computation (B, C, H, W)
+        """
+        # If no input_img provided, use target for edge detection
+        edge_source = input_img if input_img is not None else target
+        
+        # Compute edge weight
+        edge_weight = self._compute_edge_weight(edge_source)
+        
+        # Apply to pixel-wise loss
+        l1_per_pixel = torch.abs(pred - target)
+        
+        if mask is not None:
+            # Combine with mask
+            combined_weight = edge_weight * mask
+            weighted_loss = (l1_per_pixel * combined_weight).sum() / (combined_weight.sum() + 1e-8)
+        else:
+            weighted_loss = (l1_per_pixel * edge_weight).mean()
+        
+        return weighted_loss
+
+
 # ==============================================================================
 # Training
 # ==============================================================================
@@ -668,6 +875,72 @@ def set_seed(seed):
     np.random.seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def create_loss(config):
+    """
+    Create loss function based on config.loss_type.
+    
+    Options:
+    - "combined": CombinedLoss (L1 + SSIM)
+    - "masked": MaskedCombinedLoss (L1 + SSIM with mask weighting)
+    - "edge_aware": EdgeAwareLoss (L1 + SSIM + Sobel, default)
+    - "optimized": OptimizedLoss (L1 + SSIM + Grad + TV)
+    - "edge_weighted": EdgeWeightedLoss (per-pixel edge weighting)
+    """
+    loss_type = getattr(config, 'loss_type', 'edge_aware')
+    
+    if loss_type == "combined":
+        criterion = CombinedLoss(
+            l1_weight=config.l1_weight,
+            ssim_weight=config.ssim_weight
+        )
+        print(f"Using CombinedLoss (L1={config.l1_weight}, SSIM={config.ssim_weight})")
+    
+    elif loss_type == "masked":
+        criterion = MaskedCombinedLoss(
+            l1_weight=config.l1_weight,
+            ssim_weight=config.ssim_weight,
+            inside_weight=1.0,
+            outside_weight=config.mask_outside_weight
+        )
+        print(f"Using MaskedCombinedLoss (outside_weight={config.mask_outside_weight})")
+    
+    elif loss_type == "optimized":
+        criterion = OptimizedLoss(
+            l1_weight=config.l1_weight,
+            ssim_weight=config.ssim_weight,
+            grad_weight=config.grad_weight,
+            tv_weight=config.tv_weight,
+            mask_outside_weight=config.mask_outside_weight
+        )
+        print(f"Using OptimizedLoss (L1={config.l1_weight}, SSIM={config.ssim_weight}, "
+              f"Grad={config.grad_weight}, TV={config.tv_weight})")
+    
+    elif loss_type == "edge_weighted":
+        base_loss = OptimizedLoss(
+            l1_weight=config.l1_weight,
+            ssim_weight=config.ssim_weight,
+            grad_weight=config.grad_weight,
+            tv_weight=config.tv_weight,
+            mask_outside_weight=config.mask_outside_weight
+        )
+        criterion = EdgeWeightedLoss(
+            base_loss=base_loss,
+            lambda_edge=config.lambda_edge
+        )
+        print(f"Using EdgeWeightedLoss (lambda_edge={config.lambda_edge})")
+    
+    else:  # Default: edge_aware
+        criterion = EdgeAwareLoss(
+            l1_weight=config.l1_weight,
+            ssim_weight=config.ssim_weight,
+            edge_weight=config.edge_weight,
+            mask_outside_weight=config.mask_outside_weight
+        )
+        print(f"Using EdgeAwareLoss (edge_weight={config.edge_weight})")
+    
+    return criterion
 
 
 def calculate_ssim_masked(pred, target, mask, data_range=255):
@@ -870,8 +1143,10 @@ def train_epoch(model, loader, criterion, optimizer, device):
     model.train()
     total_loss = 0
     
-    # Check if criterion supports mask parameter (EdgeAwareLoss or MaskedCombinedLoss)
-    use_mask = isinstance(criterion, (MaskedCombinedLoss, EdgeAwareLoss))
+    # Check if criterion supports mask parameter
+    # All custom losses except CombinedLoss support mask
+    use_mask = isinstance(criterion, (MaskedCombinedLoss, EdgeAwareLoss, OptimizedLoss, 
+                                       EdgeWeightedLoss, SobelEdgeLoss))
     
     pbar = tqdm(loader, desc="Training")
     for batch in pbar:
@@ -908,8 +1183,9 @@ def train_epoch_weighted(model, loader, criterion, optimizer, device):
     total_loss = 0
     total_weighted_loss = 0
     
-    # Check if criterion supports mask parameter (EdgeAwareLoss or MaskedCombinedLoss)
-    use_mask = isinstance(criterion, (MaskedCombinedLoss, EdgeAwareLoss))
+    # Check if criterion supports mask parameter
+    use_mask = isinstance(criterion, (MaskedCombinedLoss, EdgeAwareLoss, OptimizedLoss, 
+                                       EdgeWeightedLoss, SobelEdgeLoss))
     
     pbar = tqdm(loader, desc="Training (weighted)")
     for batch in pbar:
@@ -952,8 +1228,9 @@ def validate(model, loader, criterion, device):
     total_psnr = 0
     n_batches = 0
     
-    # Check if criterion supports mask parameter (EdgeAwareLoss or MaskedCombinedLoss)
-    use_mask = isinstance(criterion, (MaskedCombinedLoss, EdgeAwareLoss))
+    # Check if criterion supports mask parameter
+    use_mask = isinstance(criterion, (MaskedCombinedLoss, EdgeAwareLoss, OptimizedLoss, 
+                                       EdgeWeightedLoss, SobelEdgeLoss))
     
     with torch.no_grad():
         for batch in tqdm(loader, desc="Validation"):
@@ -1001,8 +1278,9 @@ def validate_with_categories(model, loader, criterion, device, config=None):
     analyze_dist = config is not None and getattr(config, 'analyze_distribution', False)
     dist_data = {'predictions': [], 'targets': [], 'masks': [], 'sample_ids': []}
     
-    # Check if criterion supports mask parameter (EdgeAwareLoss or MaskedCombinedLoss)
-    use_mask = isinstance(criterion, (MaskedCombinedLoss, EdgeAwareLoss))
+    # Check if criterion supports mask parameter
+    use_mask = isinstance(criterion, (MaskedCombinedLoss, EdgeAwareLoss, OptimizedLoss, 
+                                       EdgeWeightedLoss, SobelEdgeLoss))
     
     with torch.no_grad():
         for batch in tqdm(loader, desc="Validation"):
@@ -1145,14 +1423,8 @@ def train(config):
     # Model
     model = create_model(config)
     
-    # Loss and optimizer (use EdgeAwareLoss for structure-preserving training)
-    criterion = EdgeAwareLoss(
-        l1_weight=config.l1_weight, 
-        ssim_weight=config.ssim_weight,
-        edge_weight=config.edge_weight,
-        mask_outside_weight=config.mask_outside_weight,
-        edge_outside_base=0.3
-    ).to(config.device)  # Move to GPU for Sobel buffers
+    # Loss and optimizer (use create_loss for configurable loss selection)
+    criterion = create_loss(config).to(config.device)  # Move to GPU for Sobel buffers
     optimizer = optim.AdamW(
         model.parameters(),
         lr=config.learning_rate,
@@ -1288,13 +1560,7 @@ def train_kfold(config, n_folds=5):
         # Create fresh model for each fold
         model = create_model(config)
         
-        criterion = EdgeAwareLoss(
-            l1_weight=config.l1_weight, 
-            ssim_weight=config.ssim_weight,
-            edge_weight=config.edge_weight,
-            mask_outside_weight=config.mask_outside_weight,
-            edge_outside_base=0.3
-        ).to(config.device)  # Move to GPU for Sobel buffers
+        criterion = create_loss(config).to(config.device)  # Move to GPU for Sobel buffers
         optimizer = optim.AdamW(
             model.parameters(),
             lr=config.learning_rate,
@@ -1543,13 +1809,7 @@ def train_worst_case_cv(config, n_folds=5):
         # Create fresh model for each fold
         model = create_model(config)
         
-        criterion = EdgeAwareLoss(
-            l1_weight=config.l1_weight, 
-            ssim_weight=config.ssim_weight,
-            edge_weight=config.edge_weight,
-            mask_outside_weight=config.mask_outside_weight,
-            edge_outside_base=0.3
-        ).to(config.device)  # Move to GPU for Sobel buffers
+        criterion = create_loss(config).to(config.device)  # Move to GPU for Sobel buffers
         optimizer = optim.AdamW(
             model.parameters(),
             lr=config.learning_rate,
@@ -1774,13 +2034,7 @@ def train_worst_case_cv_v5(config, n_folds=5):
         
         # Create model
         model = create_model(config)
-        criterion = EdgeAwareLoss(
-            l1_weight=config.l1_weight, 
-            ssim_weight=config.ssim_weight,
-            edge_weight=config.edge_weight,
-            mask_outside_weight=config.mask_outside_weight,
-            edge_outside_base=0.3
-        ).to(config.device)  # Move to GPU for Sobel buffers
+        criterion = create_loss(config).to(config.device)  # Move to GPU for Sobel buffers
         optimizer = optim.AdamW(
             model.parameters(),
             lr=config.learning_rate,
@@ -2039,6 +2293,23 @@ def predict_and_submit(config, model_path=None):
                     delta = getattr(config, 'mean_matching_delta', 0.0)
                     pred_float = pred_uint8.astype(np.float32) + delta
                     pred_uint8 = np.clip(pred_float, 0, 255).astype(np.uint8)
+                
+                # Post-processing: Median filter (salt-pepper noise removal)
+                median_size = getattr(config, 'median_filter_size', 0)
+                if median_size > 0:
+                    pred_uint8 = cv2.medianBlur(pred_uint8, median_size)
+                
+                # Post-processing: Unsharp mask (edge enhancement)
+                unsharp_strength = getattr(config, 'unsharp_strength', 0.0)
+                if unsharp_strength > 0:
+                    unsharp_radius = getattr(config, 'unsharp_radius', 1)
+                    # Gaussian blur
+                    blur_size = 2 * unsharp_radius + 1
+                    blurred = cv2.GaussianBlur(pred_uint8, (blur_size, blur_size), 0)
+                    # Unsharp mask: original + strength * (original - blurred)
+                    pred_float = pred_uint8.astype(np.float32)
+                    sharpened = pred_float + unsharp_strength * (pred_float - blurred.astype(np.float32))
+                    pred_uint8 = np.clip(sharpened, 0, 255).astype(np.uint8)
                 
                 # Flatten to 1D (262,144 pixels) - Row-major ('C') order
                 pixels_flat = pred_uint8.flatten()
