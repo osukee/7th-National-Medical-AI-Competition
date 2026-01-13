@@ -73,6 +73,10 @@ class Config:
     mean_matching_enabled = False  # Disabled for exp_016
     mean_matching_delta = 0.0      # Not used
     
+    # exp_018: Test Time Augmentation (TTA)
+    # Predict with original + horizontal flip + vertical flip + both, average results
+    tta_enabled = True  # Enable TTA for inference
+    
     # Device
     device = "cuda" if torch.cuda.is_available() else "cpu"
     
@@ -1915,6 +1919,50 @@ def train_worst_case_cv_v5(config, n_folds=5):
 # Inference and Submission
 # ==============================================================================
 
+def predict_with_tta(model, inputs, device):
+    """
+    Predict with Test Time Augmentation (TTA).
+    
+    Augmentations:
+    1. Original
+    2. Horizontal flip
+    3. Vertical flip
+    4. Both flips
+    
+    Returns averaged predictions.
+    """
+    predictions = []
+    
+    # 1. Original
+    with torch.no_grad():
+        pred = model(inputs)
+        predictions.append(pred)
+    
+    # 2. Horizontal flip
+    with torch.no_grad():
+        flipped_h = torch.flip(inputs, dims=[3])  # Flip width
+        pred_h = model(flipped_h)
+        pred_h = torch.flip(pred_h, dims=[3])  # Flip back
+        predictions.append(pred_h)
+    
+    # 3. Vertical flip
+    with torch.no_grad():
+        flipped_v = torch.flip(inputs, dims=[2])  # Flip height
+        pred_v = model(flipped_v)
+        pred_v = torch.flip(pred_v, dims=[2])  # Flip back
+        predictions.append(pred_v)
+    
+    # 4. Both flips
+    with torch.no_grad():
+        flipped_hv = torch.flip(inputs, dims=[2, 3])
+        pred_hv = model(flipped_hv)
+        pred_hv = torch.flip(pred_hv, dims=[2, 3])  # Flip back
+        predictions.append(pred_hv)
+    
+    # Average all predictions
+    avg_pred = torch.stack(predictions).mean(dim=0)
+    return avg_pred
+
 def predict_and_submit(config, model_path=None):
     """
     Run inference on test set and create submission CSV.
@@ -1967,7 +2015,11 @@ def predict_and_submit(config, model_path=None):
             inputs = batch["input"].to(config.device)
             ids = batch["id"]
             
-            outputs = torch.clamp(model(inputs), 0, 1)
+            # exp_018: Use TTA if enabled
+            if getattr(config, 'tta_enabled', False):
+                outputs = torch.clamp(predict_with_tta(model, inputs, config.device), 0, 1)
+            else:
+                outputs = torch.clamp(model(inputs), 0, 1)
             
             for i, sample_id in enumerate(ids):
                 # Get prediction as numpy array
