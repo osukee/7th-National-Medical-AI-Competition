@@ -14,17 +14,24 @@
 | architecture | unetplusplus | unetplusplus |
 | loss_type | optimized | **edge_weighted** |
 | lambda_edge | - | **2.0** |
-| ssim_weight | 1.0 | 1.0 |
-| grad_weight | 0.5 | 0.5 |
 
-## 結果
+## 結果 ❌
 
 | Metric | exp_019 | exp_020 | 変化 |
 |--------|---------|---------|------|
-| **🎯 LB Score** | 0.4307 | - | - |
-| CV SSIM | 0.704 | - | - |
-| CV PSNR | 15.49 | - | - |
+| **🎯 LB Score** | 0.4307 | **0.4120** | **-0.0187** ❌ |
+| CV SSIM | 0.704 | 0.702 | -0.002 |
+| worst_eval SSIM | 0.92 | **0.37** | **-0.55** 😱 |
 
 ## 考察
 
-(実験完了後に記載)
+**大失敗**: EdgeWeightedLoss の実装に問題あり
+
+問題点:
+- 現在の実装は L1 + エッジ重み付けのみ
+- **SSIM 損失が含まれていない** → worst samples で崩壊
+- 上位論文の実装は SSIM も含んでいる
+
+## 結論
+
+exp_019 (OptimizedLoss + U-Net++) に戻す。Edge-weighted は実装修正が必要。

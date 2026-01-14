@@ -68,7 +68,7 @@ class Config:
     
     # Loss function selection
     # Options: "combined", "masked", "edge_aware", "optimized", "edge_weighted"
-    # exp_020: Test edge_weighted loss (pixel_weight = 1 + λ * edge_map)
+    # exp_021: Fixed EdgeWeightedLoss with SSIM + Grad + edge-weighted L1
     loss_type = "edge_weighted"
     
     # Model - exp_016: Upgrade to efficientnet-b4 for better feature extraction
@@ -805,22 +805,34 @@ class OptimizedLoss(nn.Module):
 
 class EdgeWeightedLoss(nn.Module):
     """
-    Per-pixel edge-weighted loss.
+    Per-pixel edge-weighted loss with SSIM.
     
-    Weights the base loss by edge magnitude:
-        loss_pixel * (1 + λ * normalized_edge_map(input))
+    Combines:
+    1. Edge-weighted L1: L1_pixel * (1 + λ * normalized_edge_map)
+    2. SSIM loss: β * (1 - SSIM)
+    3. Gradient loss: γ * GradLoss
     
     This forces the model to pay more attention to edge regions,
     which is critical for SSIM improvement.
     
     Args:
-        base_loss: Base loss module (e.g., OptimizedLoss)
+        l1_weight: Weight for edge-weighted L1 loss
+        ssim_weight: Weight for SSIM loss (critical!)
+        grad_weight: Weight for gradient loss
         lambda_edge: Edge weighting multiplier (recommend 2.0)
+        mask_outside_weight: Weight for pixels outside mask
     """
-    def __init__(self, base_loss, lambda_edge=2.0):
+    def __init__(self, l1_weight=1.0, ssim_weight=1.0, grad_weight=0.5,
+                 lambda_edge=2.0, mask_outside_weight=0.2):
         super().__init__()
-        self.base_loss = base_loss
+        self.ssim_loss = SSIMLoss()
+        self.edge_loss = SobelEdgeLoss(outside_base=0.3)
+        
+        self.l1_weight = l1_weight
+        self.ssim_weight = ssim_weight
+        self.grad_weight = grad_weight
         self.lambda_edge = lambda_edge
+        self.mask_outside_weight = mask_outside_weight
         
         # Sobel kernels for edge detection
         sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32)
@@ -834,37 +846,50 @@ class EdgeWeightedLoss(nn.Module):
         edge_y = nn.functional.conv2d(x, self.sobel_y, padding=1)
         edge_mag = torch.sqrt(edge_x ** 2 + edge_y ** 2 + 1e-8)
         
-        # Normalize to [0, 1]
-        edge_norm = edge_mag / (edge_mag.max() + 1e-8)
+        # Normalize to [0, 1] per-sample
+        B = edge_mag.shape[0]
+        edge_norm = edge_mag.clone()
+        for i in range(B):
+            max_val = edge_mag[i].max()
+            if max_val > 1e-8:
+                edge_norm[i] = edge_mag[i] / max_val
         
         # Weight: 1 + λ * edge_norm
         return 1 + self.lambda_edge * edge_norm
     
-    def forward(self, pred, target, mask=None, input_img=None):
+    def forward(self, pred, target, mask=None):
         """
         Args:
             pred: Predicted tensor (B, C, H, W)
             target: Target tensor (B, C, H, W)
             mask: Optional mask tensor (B, C, H, W)
-            input_img: Input image for edge weight computation (B, C, H, W)
         """
-        # If no input_img provided, use target for edge detection
-        edge_source = input_img if input_img is not None else target
-        
-        # Compute edge weight
-        edge_weight = self._compute_edge_weight(edge_source)
-        
-        # Apply to pixel-wise loss
+        # 1. Edge-weighted L1 loss
+        edge_weight = self._compute_edge_weight(target)
         l1_per_pixel = torch.abs(pred - target)
         
         if mask is not None:
-            # Combine with mask
-            combined_weight = edge_weight * mask
-            weighted_loss = (l1_per_pixel * combined_weight).sum() / (combined_weight.sum() + 1e-8)
+            mask_binary = (mask > 0.5).float()
+            # Combine edge weight with mask weight
+            weight_map = edge_weight * (mask_binary + (1 - mask_binary) * self.mask_outside_weight)
+            loss_l1 = (l1_per_pixel * weight_map).sum() / (weight_map.sum() + 1e-8)
         else:
-            weighted_loss = (l1_per_pixel * edge_weight).mean()
+            loss_l1 = (l1_per_pixel * edge_weight).mean()
         
-        return weighted_loss
+        # 2. SSIM loss (critical for SSIM metric!)
+        loss_ssim = self.ssim_loss(pred, target)
+        
+        # 3. Gradient loss (edge preservation)
+        loss_grad = self.edge_loss(pred, target, mask)
+        
+        # Combined
+        total_loss = (
+            self.l1_weight * loss_l1 +
+            self.ssim_weight * loss_ssim +
+            self.grad_weight * loss_grad
+        )
+        
+        return total_loss
 
 
 # ==============================================================================
@@ -919,18 +944,15 @@ def create_loss(config):
               f"Grad={config.grad_weight}, TV={config.tv_weight})")
     
     elif loss_type == "edge_weighted":
-        base_loss = OptimizedLoss(
+        criterion = EdgeWeightedLoss(
             l1_weight=config.l1_weight,
             ssim_weight=config.ssim_weight,
             grad_weight=config.grad_weight,
-            tv_weight=config.tv_weight,
+            lambda_edge=config.lambda_edge,
             mask_outside_weight=config.mask_outside_weight
         )
-        criterion = EdgeWeightedLoss(
-            base_loss=base_loss,
-            lambda_edge=config.lambda_edge
-        )
-        print(f"Using EdgeWeightedLoss (lambda_edge={config.lambda_edge})")
+        print(f"Using EdgeWeightedLoss (L1={config.l1_weight}, SSIM={config.ssim_weight}, "
+              f"Grad={config.grad_weight}, λ_edge={config.lambda_edge})")
     
     else:  # Default: edge_aware
         criterion = EdgeAwareLoss(
