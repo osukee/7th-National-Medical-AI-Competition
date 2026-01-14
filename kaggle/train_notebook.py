@@ -68,8 +68,8 @@ class Config:
     
     # Loss function selection
     # Options: "combined", "masked", "edge_aware", "optimized", "edge_weighted"
-    # exp_017e: Use OptimizedLoss with β=1.0, γ=0.5 (recommended starting point)
-    loss_type = "optimized"
+    # exp_020: Test edge_weighted loss (pixel_weight = 1 + λ * edge_map)
+    loss_type = "edge_weighted"
     
     # Model - exp_016: Upgrade to efficientnet-b4 for better feature extraction
     encoder = "efficientnet-b4"
