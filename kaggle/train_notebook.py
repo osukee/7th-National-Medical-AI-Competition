@@ -2245,28 +2245,72 @@ def predict_and_submit(config, model_path=None):
     """
     Run inference on test set and create submission CSV.
     
+    exp_023: Weighted Fold Ensemble
+    - Load all fold models (best_model_fold{i}.pth)
+    - Each model: TTA with median (robust to geometric outliers)
+    - Across folds: weighted mean by validation SSIM
+    
     Submission format:
     - 512×512 image flattened to 262,144 pixels
     - CSV columns: id, pixel_0, pixel_1, ..., pixel_262143
     - Values: 0-255 (uint8)
     """
     print(f"\n{'='*60}")
-    print("Running Inference on Test Set")
+    print("Running Inference on Test Set (Weighted Fold Ensemble)")
     print(f"{'='*60}")
     
-    # Load model
-    model = create_model(config)
+    import cv2  # For resizing
     
-    if model_path is None:
-        model_path = config.output_dir / "best_model.pth"
+    # Load fold weights from cv_results.json
+    cv_results_path = config.output_dir / "cv_results.json"
+    fold_models = []
+    fold_weights = []
     
-    if not model_path.exists():
-        print(f"Model not found at {model_path}")
-        return None
+    if cv_results_path.exists():
+        with open(cv_results_path, 'r') as f:
+            cv_results = json.load(f)
+        
+        # Extract SSIM scores as weights
+        fold_results = cv_results.get('fold_results', [])
+        for fold_result in fold_results:
+            fold_idx = fold_result['fold'] - 1  # 0-indexed
+            fold_ssim = fold_result['ssim']
+            model_path = config.output_dir / f"best_model_fold{fold_idx}.pth"
+            
+            if model_path.exists():
+                fold_models.append(model_path)
+                fold_weights.append(fold_ssim)
+                print(f"  Fold {fold_idx}: SSIM={fold_ssim:.4f} -> {model_path.name}")
     
-    model.load_state_dict(torch.load(model_path, map_location=config.device))
-    model.eval()
-    print(f"Loaded model from {model_path}")
+    # Fallback to single best model if no fold models found
+    if not fold_models:
+        single_model_path = model_path if model_path else config.output_dir / "best_model.pth"
+        if single_model_path.exists():
+            fold_models = [single_model_path]
+            fold_weights = [1.0]
+            print(f"  Using single model: {single_model_path}")
+        else:
+            print(f"No models found!")
+            return None
+    
+    # Normalize weights using softmax with temperature
+    fold_weights = np.array(fold_weights)
+    # Softmax with temperature=10 to amplify differences
+    exp_weights = np.exp((fold_weights - fold_weights.max()) * 10)
+    fold_weights = exp_weights / exp_weights.sum()
+    
+    print(f"\nNormalized Fold Weights (softmax):")
+    for i, (model_path, weight) in enumerate(zip(fold_models, fold_weights)):
+        print(f"  Fold {i}: weight={weight:.4f}")
+    
+    # Load all models
+    models = []
+    for model_path in fold_models:
+        model = create_model(config)
+        model.load_state_dict(torch.load(model_path, map_location=config.device))
+        model.eval()
+        models.append(model)
+    print(f"\nLoaded {len(models)} models for ensemble")
     
     # Load test data
     test_df = pd.read_csv(config.test_csv)
@@ -2286,18 +2330,33 @@ def predict_and_submit(config, model_path=None):
     all_ids = []
     all_pixels = []
     
-    import cv2  # For resizing
-    
     with torch.no_grad():
-        for batch in tqdm(test_loader, desc="Inference"):
+        for batch in tqdm(test_loader, desc="Inference (Fold Ensemble)"):
             inputs = batch["input"].to(config.device)
             ids = batch["id"]
+            batch_size = inputs.shape[0]
             
-            # exp_018: Use TTA if enabled
-            if getattr(config, 'tta_enabled', False):
-                outputs = torch.clamp(predict_with_tta(model, inputs, config.device), 0, 1)
-            else:
-                outputs = torch.clamp(model(inputs), 0, 1)
+            # Collect predictions from all models
+            ensemble_preds = []
+            for model_idx, model in enumerate(models):
+                # Each model uses TTA with median (geometric outlier robust)
+                if getattr(config, 'tta_enabled', True):  # Default to True for ensemble
+                    model_pred = predict_with_tta(model, inputs, config.device)
+                else:
+                    model_pred = model(inputs)
+                model_pred = torch.clamp(model_pred, 0, 1)
+                ensemble_preds.append(model_pred)
+            
+            # Weighted mean across folds
+            # Stack: [n_models, batch, 1, H, W]
+            stacked_preds = torch.stack(ensemble_preds, dim=0)
+            
+            # Apply weights: [n_models] -> [n_models, 1, 1, 1, 1]
+            weights_tensor = torch.tensor(fold_weights, device=config.device, dtype=torch.float32)
+            weights_tensor = weights_tensor.view(-1, 1, 1, 1, 1)
+            
+            # Weighted sum
+            outputs = (stacked_preds * weights_tensor).sum(dim=0)
             
             for i, sample_id in enumerate(ids):
                 # Get prediction as numpy array
@@ -2312,7 +2371,6 @@ def predict_and_submit(config, model_path=None):
                     pred_uint8 = cv2.resize(pred_uint8, (512, 512))
                 
                 # exp_014: Apply global mean matching
-                # From distribution analysis: predictions are -16.1 darker than targets on average
                 if getattr(config, 'mean_matching_enabled', False):
                     delta = getattr(config, 'mean_matching_delta', 0.0)
                     pred_float = pred_uint8.astype(np.float32) + delta
@@ -2327,10 +2385,8 @@ def predict_and_submit(config, model_path=None):
                 unsharp_strength = getattr(config, 'unsharp_strength', 0.0)
                 if unsharp_strength > 0:
                     unsharp_radius = getattr(config, 'unsharp_radius', 1)
-                    # Gaussian blur
                     blur_size = 2 * unsharp_radius + 1
                     blurred = cv2.GaussianBlur(pred_uint8, (blur_size, blur_size), 0)
-                    # Unsharp mask: original + strength * (original - blurred)
                     pred_float = pred_uint8.astype(np.float32)
                     sharpened = pred_float + unsharp_strength * (pred_float - blurred.astype(np.float32))
                     pred_uint8 = np.clip(sharpened, 0, 255).astype(np.uint8)
@@ -2367,6 +2423,7 @@ def predict_and_submit(config, model_path=None):
     print(f"📄 Submission CSV created: {csv_path}")
     print(f"   Shape: {submission_df.shape}")
     print(f"   Size: {csv_path.stat().st_size / 1024 / 1024:.1f} MB")
+    print(f"   Ensemble: {len(models)} models with TTA median + weighted mean")
     print(f"   First row preview:")
     print(f"   id: {submission_df.iloc[0]['id']}")
     print(f"   pixel_0: {submission_df.iloc[0]['pixel_0']}")
