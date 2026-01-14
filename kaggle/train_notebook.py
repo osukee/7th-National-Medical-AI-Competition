@@ -2236,9 +2236,10 @@ def predict_with_tta(model, inputs, device):
         pred_hv = torch.flip(pred_hv, dims=[2, 3])  # Flip back
         predictions.append(pred_hv)
     
-    # Average all predictions
-    avg_pred = torch.stack(predictions).mean(dim=0)
-    return avg_pred
+    # Median ensemble (more robust to outliers than mean)
+    stacked = torch.stack(predictions)
+    median_pred = stacked.median(dim=0)[0]
+    return median_pred
 
 def predict_and_submit(config, model_path=None):
     """
