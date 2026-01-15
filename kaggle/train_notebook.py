@@ -2275,22 +2275,26 @@ def predict_and_submit(config, model_path=None):
         for fold_result in fold_results:
             fold_idx = fold_result['fold'] - 1  # 0-indexed
             fold_ssim = fold_result['ssim']
-            model_path = config.output_dir / f"best_model_fold{fold_idx}.pth"
+            fold_model_path = config.output_dir / f"best_model_fold{fold_idx}.pth"
             
-            if model_path.exists():
-                fold_models.append(model_path)
+            if fold_model_path.exists():
+                fold_models.append(fold_model_path)
                 fold_weights.append(fold_ssim)
-                print(f"  Fold {fold_idx}: SSIM={fold_ssim:.4f} -> {model_path.name}")
+                print(f"  Fold {fold_idx}: SSIM={fold_ssim:.4f} -> {fold_model_path.name}")
+            else:
+                print(f"  Fold {fold_idx}: Model not found at {fold_model_path}")
+    else:
+        print(f"  cv_results.json not found at {cv_results_path}")
     
     # Fallback to single best model if no fold models found
     if not fold_models:
-        single_model_path = model_path if model_path else config.output_dir / "best_model.pth"
-        if single_model_path.exists():
-            fold_models = [single_model_path]
+        fallback_path = model_path if model_path else config.output_dir / "best_model.pth"
+        if fallback_path.exists():
+            fold_models = [fallback_path]
             fold_weights = [1.0]
-            print(f"  Using single model: {single_model_path}")
+            print(f"  Fallback: Using single model: {fallback_path}")
         else:
-            print(f"No models found!")
+            print(f"  ERROR: No models found! Fallback path: {fallback_path}")
             return None
     
     # Normalize weights using softmax with temperature
