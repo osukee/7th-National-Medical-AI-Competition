@@ -2245,10 +2245,12 @@ def predict_and_submit(config, model_path=None):
     """
     Run inference on test set and create submission CSV.
     
-    exp_023: Weighted Fold Ensemble
+    exp_024: Edge-Aware Partial Median Ensemble
     - Load all fold models (best_model_fold{i}.pth)
     - Each model: TTA with median (robust to geometric outliers)
-    - Across folds: weighted mean by validation SSIM
+    - Across folds: 
+      - Edge areas (Sobel): weighted mean (preserve structure)
+      - Flat areas: median (kill noise)
     
     Submission format:
     - 512×512 image flattened to 262,144 pixels
@@ -2351,16 +2353,43 @@ def predict_and_submit(config, model_path=None):
                 model_pred = torch.clamp(model_pred, 0, 1)
                 ensemble_preds.append(model_pred)
             
-            # Weighted mean across folds
+            # exp_024: Edge-aware partial median ensemble
+            # - Edge areas: weighted mean (preserve structure)
+            # - Flat areas: median (kill noise)
             # Stack: [n_models, batch, 1, H, W]
             stacked_preds = torch.stack(ensemble_preds, dim=0)
             
-            # Apply weights: [n_models] -> [n_models, 1, 1, 1, 1]
+            # Compute edge mask from input using Sobel
+            # Sobel kernels
+            sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], 
+                                   dtype=torch.float32, device=config.device).view(1, 1, 3, 3)
+            sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], 
+                                   dtype=torch.float32, device=config.device).view(1, 1, 3, 3)
+            
+            # Apply Sobel to input
+            edge_x = torch.nn.functional.conv2d(inputs, sobel_x, padding=1)
+            edge_y = torch.nn.functional.conv2d(inputs, sobel_y, padding=1)
+            edge_magnitude = torch.sqrt(edge_x**2 + edge_y**2)
+            
+            # Normalize and threshold: edges where magnitude > threshold
+            edge_threshold = 0.1  # Tunable threshold
+            edge_mask = (edge_magnitude > edge_threshold).float()  # [batch, 1, H, W]
+            
+            # Dilate edge mask slightly to be conservative
+            dilate_kernel = torch.ones(1, 1, 3, 3, device=config.device)
+            edge_mask = torch.nn.functional.conv2d(edge_mask, dilate_kernel, padding=1)
+            edge_mask = (edge_mask > 0).float()
+            
+            # Compute weighted mean (for edges)
             weights_tensor = torch.tensor(fold_weights, device=config.device, dtype=torch.float32)
             weights_tensor = weights_tensor.view(-1, 1, 1, 1, 1)
+            mean_pred = (stacked_preds * weights_tensor).sum(dim=0)
             
-            # Weighted sum
-            outputs = (stacked_preds * weights_tensor).sum(dim=0)
+            # Compute median (for flat areas)
+            median_pred = stacked_preds.median(dim=0)[0]
+            
+            # Combine: edge_mask * mean + (1-edge_mask) * median
+            outputs = edge_mask * mean_pred + (1 - edge_mask) * median_pred
             
             for i, sample_id in enumerate(ids):
                 # Get prediction as numpy array
