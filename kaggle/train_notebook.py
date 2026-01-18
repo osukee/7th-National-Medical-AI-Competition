@@ -2299,8 +2299,8 @@ def predict_and_submit(config, model_path=None):
     
     # Normalize weights using softmax with temperature
     fold_weights = np.array(fold_weights)
-    # Softmax with temperature=10 to amplify differences
-    exp_weights = np.exp((fold_weights - fold_weights.max()) * 10)
+    # Softmax with temperature=7 (exp_025: reduced from 10 to balance fold weights)
+    exp_weights = np.exp((fold_weights - fold_weights.max()) * 7)
     fold_weights = exp_weights / exp_weights.sum()
     
     print(f"\nNormalized Fold Weights (softmax):")
