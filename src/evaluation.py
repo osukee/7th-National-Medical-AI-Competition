@@ -94,7 +94,9 @@ def normalize_psnr(psnr: float, min_psnr: float = 15.0, max_psnr: float = 35.0) 
     
     Returns:
         Normalized PSNR (clipped to 0-1)
-    """
+    # Handle edge case: min_psnr == max_psnr
+    if max_psnr == min_psnr:
+        return 1.0 if psnr >= max_psnr else 0.0
     normalized = (psnr - min_psnr) / (max_psnr - min_psnr)
     return float(np.clip(normalized, 0.0, 1.0))
 
