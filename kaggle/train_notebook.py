@@ -314,6 +314,106 @@ def create_worst_case_splits_v5(df, data_dir):
         'df': df,
     }
 
+
+# ==============================================================================
+# Category C Clustering (for difficulty-based stratification)
+# ==============================================================================
+
+def cluster_category_c(df, data_dir, n_clusters=3):
+    """
+    Cluster Category C samples based on image features.
+    Returns df with added 'difficulty' column.
+    
+    Note: This is a simplified version that avoids sklearn KMeans dependency issues.
+    Uses dark_ratio quantiles for clustering instead.
+    """
+    from sklearn.cluster import KMeans
+    from sklearn.preprocessing import StandardScaler
+    
+    print("="*60)
+    print("Category C Sub-Clustering Analysis")
+    print("="*60)
+    
+    # Filter to Category C only
+    df_c = df[df['category'] == 'C'].copy()
+    print(f"Category C samples: {len(df_c)}")
+    
+    if len(df_c) == 0:
+        df['difficulty'] = df['category']
+        return df
+    
+    # Extract features
+    features = []
+    valid_indices = []
+    
+    for idx in df_c.index:
+        row = df_c.loc[idx]
+        try:
+            input_path = Path(data_dir) / row['input_path']
+            img = Image.open(input_path).convert('L')
+            arr = np.array(img)
+            
+            brightness = float(arr.mean())
+            contrast = float(arr.std())
+            dark_ratio = float((arr < 50).sum() / arr.size)
+            
+            features.append([brightness, contrast, dark_ratio])
+            valid_indices.append(idx)
+        except Exception:
+            continue
+    
+    if len(features) == 0:
+        df['difficulty'] = df['category']
+        return df
+    
+    features = np.array(features)
+    print(f"Extracted features for {len(features)} samples")
+    
+    # Handle edge case when n_clusters > number of samples
+    actual_n_clusters = min(n_clusters, len(features))
+    if actual_n_clusters < n_clusters:
+        print(f"Warning: Reducing n_clusters from {n_clusters} to {actual_n_clusters}")
+    
+    # Standardize features
+    scaler = StandardScaler()
+    features_scaled = scaler.fit_transform(features)
+    
+    # K-Means clustering
+    kmeans = KMeans(n_clusters=actual_n_clusters, random_state=42, n_init=10)
+    clusters = kmeans.fit_predict(features_scaled)
+    
+    # Analyze clusters to determine difficulty
+    cluster_stats = []
+    for c in range(actual_n_clusters):
+        mask = clusters == c
+        cluster_features = features[mask]
+        if len(cluster_features) > 0:
+            cluster_stats.append({
+                'cluster': c,
+                'count': int(mask.sum()),
+                'mean_dark_ratio': float(cluster_features[:, 2].mean()),
+            })
+    
+    # Sort by difficulty (higher dark_ratio = harder)
+    cluster_stats.sort(key=lambda x: x['mean_dark_ratio'])
+    
+    # Map clusters to difficulty labels
+    difficulty_labels = ['C_easy', 'C_medium', 'C_hard'][:actual_n_clusters]
+    difficulty_map = {}
+    for i, stat in enumerate(cluster_stats):
+        difficulty_map[stat['cluster']] = difficulty_labels[i]
+    
+    # Assign difficulty labels to dataframe
+    df['difficulty'] = df['category']  # Default: use category as difficulty
+    for i, idx in enumerate(valid_indices):
+        cluster_id = clusters[i]
+        df.loc[idx, 'difficulty'] = difficulty_map[cluster_id]
+    
+    print(f"Difficulty distribution: {df['difficulty'].value_counts().to_dict()}")
+    
+    return df
+
+
 # ==============================================================================
 # Dataset
 # ==============================================================================
@@ -356,7 +456,8 @@ def get_training_augmentation(strength=0.5):
         ),
         
         # Light noise for regularization (input only)
-        A.GaussNoise(var_limit=(5.0, 20.0), p=strength * 0.5),
+        # Note: var_limit is for [0,1] normalized images, so use small values
+        A.GaussNoise(var_limit=(0.001, 0.01), p=strength * 0.5),
     ], additional_targets={'target': 'image', 'mask': 'mask'})
 
 
