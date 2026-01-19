@@ -14,6 +14,15 @@ except ImportError:
     import segmentation_models_pytorch  # Re-import after install
     print("SMP installed successfully!")
 
+# Install albumentations if not available (exp_022)
+try:
+    import albumentations as A
+except ImportError:
+    print("Installing albumentations...")
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "albumentations"])
+    import albumentations as A
+    print("Albumentations installed successfully!")
+
 import json
 import os
 import time
@@ -92,6 +101,11 @@ class Config:
     # exp_018: Test Time Augmentation (TTA)
     # Predict with original + horizontal flip + vertical flip + both, average results
     tta_enabled = True  # Enable TTA for inference
+    
+    # exp_022: Data Augmentation (training only)
+    # Enables albumentations-based augmentation for improved generalization
+    augmentation_enabled = True  # Enable data augmentation during training
+    augmentation_strength = 0.5  # Probability for most augmentations (0.3=weak, 0.5=medium, 0.7=strong)
     
     # Post-processing options (Phase A quick wins)
     median_filter_size = 0    # 0=disabled, 3=3x3 median (salt-pepper removal)
@@ -304,8 +318,51 @@ def create_worst_case_splits_v5(df, data_dir):
 # Dataset
 # ==============================================================================
 
+def get_training_augmentation(strength=0.5):
+    """
+    Create augmentation pipeline for Image-to-Image training.
+    
+    exp_022: Albumentations-based augmentation for improved generalization.
+    
+    Key considerations for Image-to-Image:
+    - Same spatial transforms must be applied to BOTH input and target
+    - Color/intensity transforms only apply to input (target is ground truth)
+    - Use additional_targets to sync input-target pairs
+    
+    Args:
+        strength: Probability for most augmentations (0.3=weak, 0.5=medium, 0.7=strong)
+    
+    Returns:
+        albumentations.Compose pipeline
+    """
+    return A.Compose([
+        # Spatial transforms (applied to both input and target)
+        A.HorizontalFlip(p=strength),
+        A.VerticalFlip(p=strength),
+        A.ShiftScaleRotate(
+            shift_limit=0.05, 
+            scale_limit=0.1, 
+            rotate_limit=15, 
+            border_mode=0,  # Constant padding
+            p=strength
+        ),
+        
+        # Intensity transforms (input only - applied via targets mechanism)
+        # Note: For grayscale, we use brightness/contrast only
+        A.RandomBrightnessContrast(
+            brightness_limit=0.1, 
+            contrast_limit=0.1, 
+            p=strength
+        ),
+        
+        # Light noise for regularization (input only)
+        A.GaussNoise(var_limit=(5.0, 20.0), p=strength * 0.5),
+    ], additional_targets={'target': 'image', 'mask': 'mask'})
+
+
 class OrganoidDataset(Dataset):
-    def __init__(self, csv_path_or_df, data_dir, image_size=512, is_test=False, indices=None, sample_weights=None):
+    def __init__(self, csv_path_or_df, data_dir, image_size=512, is_test=False, 
+                 indices=None, sample_weights=None, augmentation=None):
         if isinstance(csv_path_or_df, pd.DataFrame):
             self.df = csv_path_or_df.copy()
         else:
@@ -325,6 +382,9 @@ class OrganoidDataset(Dataset):
         # Sample weights for loss weighting (v5)
         self.sample_weights = sample_weights or {}
         
+        # exp_022: Augmentation pipeline (training only)
+        self.augmentation = augmentation
+        
     def __len__(self):
         return len(self.df)
     
@@ -337,9 +397,9 @@ class OrganoidDataset(Dataset):
         input_img = Image.open(input_path).convert("L")
         input_img = input_img.resize((self.image_size, self.image_size), Image.BILINEAR)
         input_arr = np.array(input_img, dtype=np.float32) / 255.0
-        input_tensor = torch.from_numpy(input_arr).unsqueeze(0)
         
         if self.is_test:
+            input_tensor = torch.from_numpy(input_arr).unsqueeze(0)
             return {"id": row["id"], "input": input_tensor}
         
         # Load target image
@@ -347,17 +407,40 @@ class OrganoidDataset(Dataset):
         target_img = Image.open(target_path).convert("L")
         target_img = target_img.resize((self.image_size, self.image_size), Image.BILINEAR)
         target_arr = np.array(target_img, dtype=np.float32) / 255.0
-        target_tensor = torch.from_numpy(target_arr).unsqueeze(0)
         
         # Load mask image (for LB-aligned evaluation)
-        mask_tensor = None
+        mask_arr = None
         if "mask_path" in row and pd.notna(row.get("mask_path", None)):
             mask_path = self.data_dir / row["mask_path"]
             if mask_path.exists():
                 mask_img = Image.open(mask_path).convert("L")
                 mask_img = mask_img.resize((self.image_size, self.image_size), Image.NEAREST)
                 mask_arr = np.array(mask_img, dtype=np.float32) / 255.0
-                mask_tensor = torch.from_numpy(mask_arr).unsqueeze(0)
+        
+        # exp_022: Apply augmentation (training only)
+        if self.augmentation is not None:
+            # Prepare data for albumentations (expects HWC or HW for grayscale)
+            aug_input = {
+                'image': input_arr,  # HW grayscale
+                'target': target_arr,  # HW grayscale (spatial transforms only)
+            }
+            if mask_arr is not None:
+                aug_input['mask'] = mask_arr
+            
+            # Apply augmentation
+            augmented = self.augmentation(**aug_input)
+            input_arr = augmented['image']
+            target_arr = augmented['target']
+            if mask_arr is not None:
+                mask_arr = augmented['mask']
+        
+        # Convert to tensors
+        input_tensor = torch.from_numpy(input_arr).unsqueeze(0)
+        target_tensor = torch.from_numpy(target_arr).unsqueeze(0)
+        
+        mask_tensor = None
+        if mask_arr is not None:
+            mask_tensor = torch.from_numpy(mask_arr).unsqueeze(0)
         
         # Include category for stratified evaluation
         category = row.get("category", "unknown")
@@ -1557,9 +1640,18 @@ def train_kfold(config, n_folds=5):
         print(f"Train: {len(train_idx)}, Val: {len(val_idx)}")
         print(f"{'='*60}")
         
+        # exp_022: Create augmentation for training
+        train_aug = None
+        if getattr(config, 'augmentation_enabled', False):
+            aug_strength = getattr(config, 'augmentation_strength', 0.5)
+            train_aug = get_training_augmentation(strength=aug_strength)
+            if fold == 0:  # Print only once
+                print(f"Augmentation enabled (strength={aug_strength})")
+        
         # Create datasets with indices
         train_dataset = OrganoidDataset(
-            df, config.data_dir, config.image_size, is_test=False, indices=train_idx
+            df, config.data_dir, config.image_size, is_test=False, 
+            indices=train_idx, augmentation=train_aug
         )
         val_dataset = OrganoidDataset(
             df, config.data_dir, config.image_size, is_test=False, indices=val_idx
@@ -2028,13 +2120,21 @@ def train_worst_case_cv_v5(config, n_folds=5):
         print(f"Val: {len(val_original_idx)}")
         print(f"Worst-Eval (fixed): {len(worst_eval_idx)}")
         
+        # exp_022: Create augmentation for training
+        train_aug = None
+        if getattr(config, 'augmentation_enabled', False):
+            aug_strength = getattr(config, 'augmentation_strength', 0.5)
+            train_aug = get_training_augmentation(strength=aug_strength)
+            if fold == 0:  # Print only once
+                print(f"Augmentation enabled (strength={aug_strength})")
+        
         # Create datasets with sample weights
         train_df = df.loc[train_all_idx]
         val_df = df.loc[val_original_idx]
         
         train_dataset = OrganoidDataset(
             train_df, config.data_dir, config.image_size, 
-            is_test=False, sample_weights=sample_weights
+            is_test=False, sample_weights=sample_weights, augmentation=train_aug
         )
         val_dataset = OrganoidDataset(
             val_df, config.data_dir, config.image_size, is_test=False
