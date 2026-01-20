@@ -23,6 +23,21 @@ except ImportError:
     import albumentations as A
     print("Albumentations installed successfully!")
 
+# Install trackio for experiment tracking
+try:
+    import trackio
+    TRACKIO_AVAILABLE = True
+except ImportError:
+    print("Installing trackio...")
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "trackio"])
+    try:
+        import trackio
+        TRACKIO_AVAILABLE = True
+        print("Trackio installed successfully!")
+    except ImportError:
+        TRACKIO_AVAILABLE = False
+        print("Trackio not available, skipping experiment tracking.")
+
 import json
 import os
 import time
@@ -102,10 +117,12 @@ class Config:
     # Predict with original + horizontal flip + vertical flip + both, average results
     tta_enabled = True  # Enable TTA for inference
     
-    # exp_022: Data Augmentation (training only)
-    # Enables albumentations-based augmentation for improved generalization
+    # exp_022/023: Data Augmentation (training only)
+    # exp_022 failed because brightness/contrast broke input-target correspondence
+    # exp_023: Redesigned to use geometric-only transforms
     augmentation_enabled = True  # Enable data augmentation during training
-    augmentation_strength = 0.5  # Probability for most augmentations (0.3=weak, 0.5=medium, 0.7=strong)
+    augmentation_strength = 0.5  # Probability for augmentations (0.3=weak, 0.5=medium, 0.7=strong)
+    augmentation_mode = 'geometric'  # 'geometric' (safe) or 'intensity' (deprecated)
     
     # Post-processing options (Phase A quick wins)
     median_filter_size = 0    # 0=disabled, 3=3x3 median (salt-pepper removal)
@@ -117,6 +134,10 @@ class Config:
     
     # Seed
     seed = 42
+    
+    # Experiment tracking
+    tracking_enabled = True
+    tracking_project = "medical-ai-7th"
 
 # ==============================================================================
 # Excluded Samples (all-zero target images)
@@ -418,47 +439,77 @@ def cluster_category_c(df, data_dir, n_clusters=3):
 # Dataset
 # ==============================================================================
 
-def get_training_augmentation(strength=0.5):
+def get_training_augmentation(strength=0.5, mode='geometric'):
     """
     Create augmentation pipeline for Image-to-Image training.
     
-    exp_022: Albumentations-based augmentation for improved generalization.
+    exp_023: Redesigned augmentation strategy.
     
-    Key considerations for Image-to-Image:
-    - Same spatial transforms must be applied to BOTH input and target
-    - Color/intensity transforms only apply to input (target is ground truth)
-    - Use additional_targets to sync input-target pairs
+    Key insight from exp_022 failure:
+    - Brightness/contrast changes BREAK input-target correspondence
+    - GaussNoise degrades the signal the model needs to learn from
+    - Only GEOMETRIC transforms are safe for Image-to-Image
+    
+    Modes:
+    - 'geometric': Safe transforms for Image-to-Image (flip, rotate, elastic)
+    - 'intensity': DEPRECATED - breaks correspondence (kept for comparison)
     
     Args:
-        strength: Probability for most augmentations (0.3=weak, 0.5=medium, 0.7=strong)
+        strength: Probability for augmentations (0.3=weak, 0.5=medium, 0.7=strong)
+        mode: 'geometric' (recommended) or 'intensity' (deprecated)
     
     Returns:
         albumentations.Compose pipeline
     """
-    return A.Compose([
-        # Spatial transforms (applied to both input and target)
-        A.HorizontalFlip(p=strength),
-        A.VerticalFlip(p=strength),
-        A.ShiftScaleRotate(
-            shift_limit=0.05, 
-            scale_limit=0.1, 
-            rotate_limit=15, 
-            border_mode=0,  # Constant padding
-            p=strength
-        ),
-        
-        # Intensity transforms (input only - applied via targets mechanism)
-        # Note: For grayscale, we use brightness/contrast only
-        A.RandomBrightnessContrast(
-            brightness_limit=0.1, 
-            contrast_limit=0.1, 
-            p=strength
-        ),
-        
-        # Light noise for regularization (input only)
-        # Note: var_limit is for [0,1] normalized images, so use small values
-        A.GaussNoise(var_limit=(0.001, 0.01), p=strength * 0.5),
-    ], additional_targets={'target': 'image', 'mask': 'mask'})
+    if mode == 'geometric':
+        # exp_023: Geometric-only augmentation (safe for Image-to-Image)
+        return A.Compose([
+            # Flip transforms (absolutely safe - no interpolation)
+            A.HorizontalFlip(p=strength),
+            A.VerticalFlip(p=strength),
+            
+            # Rotation with 90-degree increments (no interpolation artifacts)
+            A.RandomRotate90(p=strength),
+            
+            # Small affine transforms (interpolation but structure-preserving)
+            A.ShiftScaleRotate(
+                shift_limit=0.03,      # Reduced from 0.05
+                scale_limit=0.05,      # Reduced from 0.1
+                rotate_limit=10,       # Reduced from 15
+                border_mode=0,         # Constant padding (black)
+                p=strength * 0.5       # Lower probability
+            ),
+            
+            # Elastic transform - simulates cell deformation (key for organoid data)
+            A.ElasticTransform(
+                alpha=50,              # Deformation intensity
+                sigma=5,               # Smoothness of deformation
+                border_mode=0,
+                p=strength * 0.3       # Use sparingly
+            ),
+        ], additional_targets={'target': 'image', 'mask': 'mask'})
+    
+    else:
+        # DEPRECATED: Original exp_022 approach (kept for A/B comparison)
+        # WARNING: This breaks input-target correspondence!
+        return A.Compose([
+            A.HorizontalFlip(p=strength),
+            A.VerticalFlip(p=strength),
+            A.ShiftScaleRotate(
+                shift_limit=0.05, 
+                scale_limit=0.1, 
+                rotate_limit=15, 
+                border_mode=0,
+                p=strength
+            ),
+            # These HARM the model:
+            A.RandomBrightnessContrast(
+                brightness_limit=0.1, 
+                contrast_limit=0.1, 
+                p=strength
+            ),
+            A.GaussNoise(var_limit=(0.001, 0.01), p=strength * 0.5),
+        ], additional_targets={'target': 'image', 'mask': 'mask'})
 
 
 class OrganoidDataset(Dataset):
@@ -1741,13 +1792,34 @@ def train_kfold(config, n_folds=5):
         print(f"Train: {len(train_idx)}, Val: {len(val_idx)}")
         print(f"{'='*60}")
         
-        # exp_022: Create augmentation for training
+        # Initialize Trackio for this fold
+        if TRACKIO_AVAILABLE and getattr(config, 'tracking_enabled', False):
+            experiment_name = os.environ.get("EXPERIMENT_ID", "exp_unknown")
+            trackio.init(
+                project=config.tracking_project,
+                name=f"{experiment_name}_fold{fold}",
+                config={
+                    "architecture": getattr(config, 'architecture', 'unet'),
+                    "encoder": config.encoder,
+                    "loss_type": getattr(config, 'loss_type', 'combined'),
+                    "learning_rate": config.learning_rate,
+                    "epochs": config.epochs,
+                    "batch_size": config.batch_size,
+                    "fold": fold,
+                    "n_folds": n_folds,
+                    "image_size": config.image_size,
+                    "augmentation_enabled": getattr(config, 'augmentation_enabled', False),
+                }
+            )
+        
+        # exp_023: Create augmentation for training (geometric-only mode)
         train_aug = None
         if getattr(config, 'augmentation_enabled', False):
             aug_strength = getattr(config, 'augmentation_strength', 0.5)
-            train_aug = get_training_augmentation(strength=aug_strength)
+            aug_mode = getattr(config, 'augmentation_mode', 'geometric')
+            train_aug = get_training_augmentation(strength=aug_strength, mode=aug_mode)
             if fold == 0:  # Print only once
-                print(f"Augmentation enabled (strength={aug_strength})")
+                print(f"Augmentation enabled (strength={aug_strength}, mode={aug_mode})")
         
         # Create datasets with indices
         train_dataset = OrganoidDataset(
@@ -1799,6 +1871,22 @@ def train_kfold(config, n_folds=5):
             print(f"Val SSIM: {val_metrics['ssim']:.4f} (A:{val_metrics['ssim_A']:.4f}, B:{val_metrics['ssim_B']:.4f}, C:{val_metrics['ssim_C']:.4f})")
             print(f"Val PSNR: {val_metrics['psnr']:.2f} (A:{val_metrics['psnr_A']:.2f}, B:{val_metrics['psnr_B']:.2f}, C:{val_metrics['psnr_C']:.2f})")
             
+            # Log metrics to Trackio
+            if TRACKIO_AVAILABLE and getattr(config, 'tracking_enabled', False):
+                lb_score = calculate_lb_score(val_metrics['ssim'], val_metrics['psnr'])
+                trackio.log({
+                    "epoch": epoch,
+                    "train/loss": train_loss,
+                    "val/ssim": val_metrics['ssim'],
+                    "val/psnr": val_metrics['psnr'],
+                    "val/lb_score": lb_score,
+                    "val/ssim_A": val_metrics['ssim_A'],
+                    "val/ssim_B": val_metrics['ssim_B'],
+                    "val/ssim_C": val_metrics['ssim_C'],
+                    "val/ssim_C_worst20": val_metrics.get('ssim_C_worst20', 0),
+                    "learning_rate": optimizer.param_groups[0]['lr'],
+                })
+            
             if val_metrics['ssim'] > best_fold_ssim:
                 best_fold_ssim = val_metrics['ssim']
                 # Save best model for this fold
@@ -1819,6 +1907,15 @@ def train_kfold(config, n_folds=5):
             'psnr_C': final_metrics['psnr_C'],
             'psnr_C_worst20': final_metrics['psnr_C_worst20'],
         })
+        
+        # Log fold summary to Trackio
+        if TRACKIO_AVAILABLE and getattr(config, 'tracking_enabled', False):
+            trackio.log({
+                f"fold{fold}/best_ssim": best_fold_ssim,
+                f"fold{fold}/final_ssim": final_metrics['ssim'],
+                f"fold{fold}/final_psnr": final_metrics['psnr'],
+            })
+            trackio.finish()
         
         if final_metrics['ssim'] > best_overall_ssim:
             best_overall_ssim = final_metrics['ssim']
