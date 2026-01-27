@@ -95,8 +95,8 @@ class Config:
     # exp_021: Fixed EdgeWeightedLoss with SSIM + Grad + edge-weighted L1
     loss_type = "edge_weighted"
     
-    # Model - exp_016: Upgrade to efficientnet-b4 for better feature extraction
-    encoder = "efficientnet-b4"
+    # Model - exp_024: Upgrade to efficientnet-b5 for even better feature extraction
+    encoder = "efficientnet-b5"
     encoder_weights = "imagenet"
     
     # Architecture selection
