@@ -73,7 +73,7 @@ class Config:
     
     # Training
     epochs = 15  # SMP U-Net with more epochs for convergence
-    batch_size = 8
+    batch_size = 4  # Reduced from 8 for efficientnet-b5 (larger model)
     learning_rate = 1e-4
     weight_decay = 1e-5
     num_workers = 2
