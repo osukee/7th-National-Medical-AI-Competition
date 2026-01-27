@@ -108,10 +108,11 @@ train_00863_target.png
 | exp_015 | Baseline Fix | 0.407 | - |
 | exp_016 | EfficientNet-b4 | 0.419 | +0.012 |
 | exp_018 | TTA (4-way) | 0.428 | +0.009 |
-| **exp_019** | **U-Net++** | **0.4307** | +0.003 |
-| exp_022 | Augmentation | (実行中) | - |
+| exp_019 | U-Net++ | 0.4307 | +0.003 |
+| exp_022 | Intensity Aug | 0.43035 | -0.0004 ❌ |
+| **exp_023** | **Geometric Aug** | **0.44039** | +0.010 ✅ |
 
-**現在のベスト: 0.4307** / 目標: 0.46
+**現在のベスト: 0.44039** / 目標: 0.46
 
 ### 効果あり ✅
 
@@ -120,6 +121,7 @@ train_00863_target.png
 | **EfficientNet-b4** | +0.012 | exp_016 |
 | **TTA (4-way flip)** | +0.009 | exp_018 |
 | **U-Net++** | +0.003 | exp_019 |
+| **Geometric Aug** | +0.010 | exp_023 |
 | **OptimizedLoss** (L1+SSIM+Grad+TV) | 安定 | exp_017e |
 
 ### 効果なし/逆効果 ❌
@@ -129,6 +131,7 @@ train_00863_target.png
 | Mean Matching | 効果なし (LB同等) | exp_014/015 |
 | EdgeWeightedLoss (v1) | 不安定 | exp_020 |
 | Temperature調整のみ | 微小効果 | exp_025/026 |
+| Intensity Aug (Brightness/Contrast) | 逆効果 | exp_022 |
 
 ### 現在の最適構成
 
@@ -146,9 +149,8 @@ grad_weight = 0.5
 # Inference
 tta_enabled = True  # 4-way flip average
 
-# exp_022 (testing)
-augmentation_enabled = True
-augmentation_strength = 0.5
+# exp_023 (current best)
+augmentation_mode = "geometric"  # Flip, Rotate90, ShiftScaleRotate, Elastic
 ```
 
 ---
@@ -168,11 +170,12 @@ EXCLUDED_SAMPLE_IDS = {
 
 ## 7. 次の改善候補
 
-1. **Augmentation** (exp_022) - 実行中
-2. **Encoder upgrade** (B5/B6)
+1. ~~**Augmentation** (exp_022/023)~~ ✅ Geometric-onlyが有効
+2. **Encoder upgrade** (B5/B6) - 次の候補
 3. **3ch入力** (グレースケール+エッジ+コントラスト)
 4. **補助ロス** (カテゴリ分類)
 5. **Pseudo-labeling**
+6. **Fold加重平均アンサンブル**
 
 ---
 

@@ -32,15 +32,20 @@ A.Compose([
 
 | Metric | exp_019 | exp_022 | 変化 |
 |--------|---------|---------|------|
-| **🎯 LB Score** | 0.4307 | - | - |
+| **🎯 LB Score** | 0.4307 | **0.43035** | -0.0004 |
 | CV SSIM | 0.704 | - | - |
 | CV PSNR | 15.49 | - | - |
 
 ## 考察
 
-(実験完了後に記載)
+- Augmentationの効果は **ほぼなし** (微減)
+- 仮説: 
+  - このタスクはすでにデータ効率が良く、追加augmentationの恩恵が少ない
+  - Image-to-Image生成では、入力/ターゲットの対応関係が重要で、augmentationがこの関係を乱した可能性
+  - brightness/contrastの変更が蛍光画像予測に悪影響した可能性
 
 ## 次のアクション
 
-- [ ] exp_023: EfficientNet-B5 encoder upgrade
+- [x] exp_022 完了 (効果なし)
+- [ ] exp_023: EfficientNet-B5 encoder upgrade (より有望)
 - [ ] exp_024: 3ch入力 (グレースケール+エッジ+コントラスト)
