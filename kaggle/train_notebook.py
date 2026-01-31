@@ -124,6 +124,12 @@ class Config:
     augmentation_strength = 0.5  # Probability for augmentations (0.3=weak, 0.5=medium, 0.7=strong)
     augmentation_mode = 'geometric'  # 'geometric' (safe) or 'intensity' (deprecated)
     
+    # exp_025: Fold Selection Ensemble
+    # Select top N folds by SSIM (reject weak folds to reduce noise)
+    # rank-based weights instead of softmax (preserves differentiation)
+    n_folds_ensemble = 3              # Use top 3 folds only
+    fold_rank_weights = [1.0, 0.7, 0.4]  # Weights by rank (best, mid, low)
+    
     # Post-processing options (Phase A quick wins)
     median_filter_size = 0    # 0=disabled, 3=3x3 median (salt-pepper removal)
     unsharp_strength = 0.0    # 0=disabled, 0.5=recommended (edge enhancement)
@@ -2568,19 +2574,49 @@ def predict_and_submit(config, model_path=None):
         with open(cv_results_path, 'r') as f:
             cv_results = json.load(f)
         
-        # Extract SSIM scores as weights
+        # Extract SSIM scores for fold selection
         fold_results = cv_results.get('fold_results', [])
+        fold_data = []
+        
         for fold_result in fold_results:
             fold_idx = fold_result['fold'] - 1  # 0-indexed
             fold_ssim = fold_result['ssim']
             fold_model_path = config.output_dir / f"best_model_fold{fold_idx}.pth"
             
             if fold_model_path.exists():
-                fold_models.append(fold_model_path)
-                fold_weights.append(fold_ssim)
+                fold_data.append({
+                    'idx': fold_idx,
+                    'ssim': fold_ssim,
+                    'path': fold_model_path
+                })
                 print(f"  Fold {fold_idx}: SSIM={fold_ssim:.4f} -> {fold_model_path.name}")
             else:
                 print(f"  Fold {fold_idx}: Model not found at {fold_model_path}")
+        
+        # exp_025: Top-3 Fold Selection (critical change)
+        # Sort by SSIM descending and take top 3
+        fold_data.sort(key=lambda x: x['ssim'], reverse=True)
+        
+        n_select = getattr(config, 'n_folds_ensemble', 3)  # Default: top 3
+        selected_folds = fold_data[:n_select]
+        
+        print(f"\n  exp_025: Selecting top {n_select} folds (noise reduction)")
+        for i, fold in enumerate(selected_folds):
+            print(f"    Rank {i+1}: Fold {fold['idx']} (SSIM={fold['ssim']:.4f})")
+        
+        # Rejected folds
+        rejected_folds = fold_data[n_select:]
+        if rejected_folds:
+            print(f"  Rejected {len(rejected_folds)} weak folds:")
+            for fold in rejected_folds:
+                print(f"    Fold {fold['idx']} (SSIM={fold['ssim']:.4f}) - EXCLUDED")
+        
+        fold_models = [f['path'] for f in selected_folds]
+        
+        # exp_025: Rank-based weights (NOT softmax)
+        # Best = 1.0, Mid = 0.7, Low = 0.4 (or custom from config)
+        rank_weights = getattr(config, 'fold_rank_weights', [1.0, 0.7, 0.4])
+        fold_weights = rank_weights[:len(fold_models)]
     else:
         print(f"  cv_results.json not found at {cv_results_path}")
     
@@ -2595,15 +2631,13 @@ def predict_and_submit(config, model_path=None):
             print(f"  ERROR: No models found! Fallback path: {fallback_path}")
             return None
     
-    # Normalize weights using softmax with temperature
+    # Normalize rank-based weights to sum to 1
     fold_weights = np.array(fold_weights)
-    # Softmax with temperature=5 to amplify differences (exp_026: temp 5)
-    exp_weights = np.exp((fold_weights - fold_weights.max()) * 5)
-    fold_weights = exp_weights / exp_weights.sum()
+    fold_weights = fold_weights / fold_weights.sum()
     
-    print(f"\nNormalized Fold Weights (softmax):")
-    for i, (model_path, weight) in enumerate(zip(fold_models, fold_weights)):
-        print(f"  Fold {i}: weight={weight:.4f}")
+    print(f"\nexp_025 Fold Weights (rank-based, normalized):")
+    for i, (mpath, weight) in enumerate(zip(fold_models, fold_weights)):
+        print(f"  Rank {i+1}: weight={weight:.4f}")
     
     # Load all models
     models = []
