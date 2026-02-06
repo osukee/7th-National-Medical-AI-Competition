@@ -116,6 +116,8 @@ class Config:
     # exp_018: Test Time Augmentation (TTA)
     # Predict with original + horizontal flip + vertical flip + both, average results
     tta_enabled = True  # Enable TTA for inference
+    tta_mode = "flip4"  # "flip4" (default) or "dihedral8"
+    tta_aggregate = "median"  # "median" or "mean"
     
     # exp_022/023: Data Augmentation (training only)
     # exp_022 failed because brightness/contrast broke input-target correspondence
@@ -2500,50 +2502,52 @@ def train_worst_case_cv_v5(config, n_folds=5):
 # Inference and Submission
 # ==============================================================================
 
-def predict_with_tta(model, inputs, device):
+def _build_tta_transforms(mode):
+    """Return a list of (forward, inverse) TTA transforms."""
+    if mode == "flip4":
+        return [
+            (lambda x: x, lambda x: x),
+            (lambda x: torch.flip(x, dims=[3]), lambda x: torch.flip(x, dims=[3])),
+            (lambda x: torch.flip(x, dims=[2]), lambda x: torch.flip(x, dims=[2])),
+            (lambda x: torch.flip(x, dims=[2, 3]), lambda x: torch.flip(x, dims=[2, 3])),
+        ]
+    if mode == "dihedral8":
+        transforms = []
+        for k in range(4):
+            rot = lambda x, k=k: torch.rot90(x, k, dims=[2, 3])
+            inv_rot = lambda x, k=k: torch.rot90(x, (-k) % 4, dims=[2, 3])
+            transforms.append((rot, inv_rot))
+            rot_flip = lambda x, k=k: torch.flip(torch.rot90(x, k, dims=[2, 3]), dims=[3])
+            inv_rot_flip = lambda x, k=k: torch.rot90(torch.flip(x, dims=[3]), (-k) % 4, dims=[2, 3])
+            transforms.append((rot_flip, inv_rot_flip))
+        return transforms
+    print(f"Warning: Unknown tta_mode '{mode}', falling back to flip4")
+    return _build_tta_transforms("flip4")
+
+
+def predict_with_tta(model, inputs, device, mode="flip4", aggregate="median"):
     """
     Predict with Test Time Augmentation (TTA).
     
-    Augmentations:
-    1. Original
-    2. Horizontal flip
-    3. Vertical flip
-    4. Both flips
+    Modes:
+    - flip4: original + H/V/both flips
+    - dihedral8: 90-degree rotations and horizontal flips
     
-    Returns averaged predictions.
+    Aggregate:
+    - median (robust) or mean
     """
     predictions = []
+    transforms = _build_tta_transforms(mode)
     
-    # 1. Original
-    with torch.no_grad():
-        pred = model(inputs)
-        predictions.append(pred)
+    for forward_t, inverse_t in transforms:
+        with torch.no_grad():
+            pred = model(forward_t(inputs))
+            predictions.append(inverse_t(pred))
     
-    # 2. Horizontal flip
-    with torch.no_grad():
-        flipped_h = torch.flip(inputs, dims=[3])  # Flip width
-        pred_h = model(flipped_h)
-        pred_h = torch.flip(pred_h, dims=[3])  # Flip back
-        predictions.append(pred_h)
-    
-    # 3. Vertical flip
-    with torch.no_grad():
-        flipped_v = torch.flip(inputs, dims=[2])  # Flip height
-        pred_v = model(flipped_v)
-        pred_v = torch.flip(pred_v, dims=[2])  # Flip back
-        predictions.append(pred_v)
-    
-    # 4. Both flips
-    with torch.no_grad():
-        flipped_hv = torch.flip(inputs, dims=[2, 3])
-        pred_hv = model(flipped_hv)
-        pred_hv = torch.flip(pred_hv, dims=[2, 3])  # Flip back
-        predictions.append(pred_hv)
-    
-    # Median ensemble (more robust to outliers than mean)
-    stacked = torch.stack(predictions)
-    median_pred = stacked.median(dim=0)[0]
-    return median_pred
+    stacked = torch.stack(predictions, dim=0)
+    if aggregate == "mean":
+        return stacked.mean(dim=0)
+    return stacked.median(dim=0)[0]
 
 def predict_and_submit(config, model_path=None):
     """
@@ -2677,7 +2681,15 @@ def predict_and_submit(config, model_path=None):
             for model_idx, model in enumerate(models):
                 # Each model uses TTA with median (geometric outlier robust)
                 if getattr(config, 'tta_enabled', True):  # Default to True for ensemble
-                    model_pred = predict_with_tta(model, inputs, config.device)
+                    tta_mode = getattr(config, 'tta_mode', "flip4")
+                    tta_aggregate = getattr(config, 'tta_aggregate', "median")
+                    model_pred = predict_with_tta(
+                        model,
+                        inputs,
+                        config.device,
+                        mode=tta_mode,
+                        aggregate=tta_aggregate,
+                    )
                 else:
                     model_pred = model(inputs)
                 model_pred = torch.clamp(model_pred, 0, 1)
