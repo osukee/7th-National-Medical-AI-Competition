@@ -20,6 +20,9 @@ from skimage.metrics import peak_signal_noise_ratio as psnr
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 
+# Local evaluation utilities (mask-based scoring)
+from evaluation import calculate_ssim_masked, calculate_psnr_masked
+
 # Try to import segmentation_models_pytorch, fallback to simple U-Net if not available
 try:
     import segmentation_models_pytorch as smp
@@ -69,13 +72,21 @@ class Config:
     seed = 42
 
 
+EXCLUDED_SAMPLE_IDS = {
+    "train_00099", "train_00603", "train_00802", "train_00863"
+}
+
+
 # ==============================================================================
 # Dataset
 # ==============================================================================
 
 class OrganoidDataset(Dataset):
-    def __init__(self, csv_path, data_dir, image_size=512, is_test=False):
-        self.df = pd.read_csv(csv_path)
+    def __init__(self, csv_or_df, data_dir, image_size=512, is_test=False):
+        if isinstance(csv_or_df, (str, Path)):
+            self.df = pd.read_csv(csv_or_df)
+        else:
+            self.df = csv_or_df.reset_index(drop=True)
         self.data_dir = Path(data_dir)
         self.image_size = image_size
         self.is_test = is_test
@@ -269,10 +280,11 @@ def set_seed(seed):
         torch.cuda.manual_seed_all(seed)
 
 
-def calculate_metrics(pred, target):
-    """Calculate SSIM and PSNR for a batch."""
+def calculate_metrics(pred, target, mask=None):
+    """Calculate SSIM and PSNR for a batch (mask-based when available)."""
     pred_np = pred.cpu().numpy()
     target_np = target.cpu().numpy()
+    mask_np = mask.cpu().numpy() if mask is not None else None
     
     ssim_scores = []
     psnr_scores = []
@@ -280,13 +292,21 @@ def calculate_metrics(pred, target):
     for i in range(pred_np.shape[0]):
         p = pred_np[i, 0]
         t = target_np[i, 0]
+        m = mask_np[i, 0] if mask_np is not None else None
         
         # Clip to valid range
         p = np.clip(p, 0, 1)
         t = np.clip(t, 0, 1)
         
-        ssim_val = ssim(t, p, data_range=1.0)
-        psnr_val = psnr(t, p, data_range=1.0)
+        if m is not None:
+            p_255 = (p * 255.0).astype(np.float64)
+            t_255 = (t * 255.0).astype(np.float64)
+            m_255 = (m > 0.5).astype(np.uint8) * 255
+            ssim_val = calculate_ssim_masked(p_255, t_255, m_255, data_range=255)
+            psnr_val = calculate_psnr_masked(p_255, t_255, m_255, data_range=255)
+        else:
+            ssim_val = ssim(t, p, data_range=1.0)
+            psnr_val = psnr(t, p, data_range=1.0)
         
         ssim_scores.append(ssim_val)
         psnr_scores.append(psnr_val)
@@ -330,6 +350,7 @@ def validate(model, loader, criterion, device):
         for batch in tqdm(loader, desc="Validation"):
             inputs = batch["input"].to(device)
             targets = batch["target"].to(device)
+            masks = batch["mask"].to(device)
             
             outputs = model(inputs)
             outputs = torch.clamp(outputs, 0, 1)
@@ -337,7 +358,7 @@ def validate(model, loader, criterion, device):
             loss = criterion(outputs, targets)
             total_loss += loss.item()
             
-            batch_ssim, batch_psnr = calculate_metrics(outputs, targets)
+            batch_ssim, batch_psnr = calculate_metrics(outputs, targets, masks)
             total_ssim += batch_ssim
             total_psnr += batch_psnr
             n_batches += 1
@@ -356,12 +377,14 @@ def train(config):
     config.output_dir.mkdir(parents=True, exist_ok=True)
     
     # Dataset
-    full_dataset = OrganoidDataset(
-        config.train_csv,
-        config.data_dir,
-        config.image_size,
-        is_test=False
-    )
+    df = pd.read_csv(config.train_csv)
+    if "id" in df.columns and EXCLUDED_SAMPLE_IDS:
+        excluded = df[df["id"].isin(EXCLUDED_SAMPLE_IDS)]
+        if not excluded.empty:
+            print(f"Excluding {len(excluded)} samples with empty targets: {sorted(EXCLUDED_SAMPLE_IDS)}")
+        df = df[~df["id"].isin(EXCLUDED_SAMPLE_IDS)].reset_index(drop=True)
+    
+    full_dataset = OrganoidDataset(df, config.data_dir, config.image_size, is_test=False)
     
     # Train/Val split
     n_samples = len(full_dataset)

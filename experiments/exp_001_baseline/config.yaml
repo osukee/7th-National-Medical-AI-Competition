@@ -45,6 +45,11 @@ data:
   image_size: 512
   train_split: 0.8
   val_split: 0.2
+  excluded_ids:
+    - train_00099
+    - train_00603
+    - train_00802
+    - train_00863
   augmentation:
     enabled: false        # Baseline without augmentation
     horizontal_flip: false
@@ -66,8 +71,8 @@ logging:
   log_interval: 10
   save_interval: 10
   metrics:
-    - ssim
-    - psnr
+    - ssim_masked
+    - psnr_masked
     - l1_loss
 
 # Output

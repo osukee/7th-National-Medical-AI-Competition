@@ -23,21 +23,32 @@
 
 ## 2. 評価指標
 
-| 指標 | 役割 | 値域 | 目標方向 |
-|------|------|------|----------|
-| **SSIM** | 主指標 | 0.0 〜 1.0 | 高いほど良い |
-| **PSNR** | 補助指標 | 0 〜 ∞ dB | 高いほど良い |
+### 最終スコア（LB Score）
 
-### 計算式
+$$Score = \frac{SSIM + PSNR_{norm}}{2}$$
 
-**SSIM (Structural Similarity Index)**:
+| 成分 | 計算式 | 値域 |
+|------|--------|------|
+| **SSIM** | 構造的類似度（mask内で計算） | 0.0 〜 1.0 |
+| **PSNR** | $20 \times \log_{10}(255 / \sqrt{MSE})$ | dB単位 |
+| **PSNR_norm** | $\text{clip}((PSNR - 15) / 20, 0, 1)$ | 0.0 〜 1.0 |
+
+> [!IMPORTANT]
+> - **PSNR 15 dB → norm 0.0**
+> - **PSNR 35 dB → norm 1.0**
+> - 評価は**マスク領域内**で行われる（data_range=255）
+
+### SSIM 詳細
+
 ```
 SSIM(x,y) = (2μxμy + C1)(2σxy + C2) / ((μx² + μy² + C1)(σx² + σy² + C2))
+C1 = (0.01 × 255)², C2 = (0.03 × 255)²
 ```
 
-**PSNR (Peak Signal-to-Noise Ratio)**:
+### PSNR 詳細
+
 ```
-PSNR = 10 × log10(MAX² / MSE)
+PSNR = 20 × log10(255 / √MSE)  [dB]
 ```
 
 ---
@@ -61,16 +72,23 @@ test_002,100,105,110,...,98
 ---
 
 ## 4. 実務上の重要ポイント
+trainセットの透過画像にオルガノイドがうまく写っておらず、蛍光画像(target)の全画素が０である画像が四枚あります。
 
+train_00099_target.png
+train_00603_target.png
+train_00802_target.png
+train_00863_target.png
+なお、testセットにそのような画像は含まれません。
 ### 優先順位
 
 1. **構造保持が最優先（SSIM）**
    - エッジ・テクスチャの再現性が評価の要
    - ぼやけた出力は厳しくペナルティを受ける
 
-2. **明るさの絶対値より分布が重要**
-   - 全体的なシフトより局所的なコントラスト
-   - ヒストグラムの形状を意識
+2. **絶対輝度の安定性が重要**
+   - sample間でmeanがブレない
+   - 極端に暗く/明るくならない
+   - 45閾値付近が潰れない
 
 3. **ノイズはPSNRを著しく下げる**
    - ソルト&ペッパーノイズは致命的
@@ -78,31 +96,99 @@ test_002,100,105,110,...,98
 
 ---
 
-## 5. 勝ち筋仮説（初期）
+## 5. 検証済み知見（実験結果より）
 
 > [!NOTE]
-> 以下は初期仮説。実験結果に基づいて更新すること。
+> 以下は実験結果に基づく **検証済みの知見**。
 
-### アーキテクチャ
+### ベストスコア推移
 
-- **U-Net + Encoder転移学習**
-  - ImageNet pretrained encoder（ResNet34/EfficientNet）
-  - Skip connection による詳細保持
+| 実験 | 変更内容 | LB Score | 累積改善 |
+|------|----------|----------|----------|
+| exp_015 | Baseline Fix | 0.407 | - |
+| exp_016 | EfficientNet-b4 | 0.419 | +0.012 |
+| exp_018 | TTA (4-way) | 0.428 | +0.009 |
+| exp_019 | U-Net++ | 0.4307 | +0.003 |
+| exp_022 | Intensity Aug | 0.43035 | -0.0004 ❌ |
+| **exp_023** | **Geometric Aug** | **0.44039** | +0.010 ✅ |
 
-### 損失関数
+**現在のベスト: 0.44039** / 目標: 0.46
 
+### 効果あり ✅
+
+| 手法 | 効果 | 実験 |
+|------|------|------|
+| **EfficientNet-b4** | +0.012 | exp_016 |
+| **TTA (4-way flip)** | +0.009 | exp_018 |
+| **U-Net++** | +0.003 | exp_019 |
+| **Geometric Aug** | +0.010 | exp_023 |
+| **OptimizedLoss** (L1+SSIM+Grad+TV) | 安定 | exp_017e |
+
+### 効果なし/逆効果 ❌
+
+| 手法 | 結果 | 実験 |
+|------|------|------|
+| Mean Matching | 効果なし (LB同等) | exp_014/015 |
+| EdgeWeightedLoss (v1) | 不安定 | exp_020 |
+| Temperature調整のみ | 微小効果 | exp_025/026 |
+| Intensity Aug (Brightness/Contrast) | 逆効果 | exp_022 |
+
+### 現在の最適構成
+
+```python
+# Model
+architecture = "unetplusplus"
+encoder = "efficientnet-b4"
+encoder_weights = "imagenet"
+
+# Loss
+loss_type = "optimized"  # L1 + SSIM + Grad + TV
+ssim_weight = 1.0
+grad_weight = 0.5
+
+# Inference
+tta_enabled = True  # 4-way flip average
+
+# exp_023 (current best)
+augmentation_mode = "geometric"  # Flip, Rotate90, ShiftScaleRotate, Elastic
 ```
-Loss = L1 + λ × SSIM_Loss
-```
-
-- L1: ピクセル単位の誤差最小化
-- SSIM Loss: 構造的類似度の最適化
-- λ: ハイパーパラメータ（初期値 0.5〜1.0）
 
 ---
 
-## 6. 制約事項
+## 6. 除外サンプル
 
+以下4サンプルはターゲットが全黒のため学習から除外：
+
+```python
+EXCLUDED_SAMPLE_IDS = {
+    'train_00099', 'train_00603', 
+    'train_00802', 'train_00863'
+}
+```
+
+---
+
+## 7. 次の改善候補
+
+1. ~~**Augmentation** (exp_022/023)~~ ✅ Geometric-onlyが有効
+2. **Encoder upgrade** (B5/B6) - 次の候補
+3. **3ch入力** (グレースケール+エッジ+コントラスト)
+4. **補助ロス** (カテゴリ分類)
+5. **Pseudo-labeling**
+6. **Fold加重平均アンサンブル**
+
+---
+
+## 8. 制約事項
+
+- [x] 評価はマスク領域内で計算 (data_range=255)
+- [x] 提出形式: 512×512画像 → 262,144ピクセルフラット化
+- [x] 外部データ・事前学習モデルの使用: 公開データ由来の事前学習重みは許可
 - [ ] 提出回数制限（要確認）
 - [ ] 推論時間制限（要確認）
-- [ ] 使用可能な外部データ（要確認）
+
+### 8.1 外部データ・事前学習モデルの使用
+
+ImageNetやCOCOなど、一般に公開されており誰でも利用可能なデータセットで事前学習されたモデル（重み）の使用は、学習手法（教師あり・自己教師あり）を問わず許可する。  
+独自に作成したデータや、特定の参加者しかアクセスできない非公開データの使用は禁止。
+
