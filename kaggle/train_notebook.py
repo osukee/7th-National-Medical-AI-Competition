@@ -146,6 +146,13 @@ class Config:
     # Experiment tracking
     tracking_enabled = True
     tracking_project = "medical-ai-7th"
+    
+    # exp_027: VirtualStaining Transfer Learning
+    transfer_learning_enabled = True
+    pretrained_encoder_path = "/kaggle/input/virtualstaining-pretrained/best_model.pth"
+    encoder_lr = 1e-5   # Low LR for encoder (fine-tune)
+    decoder_lr = 1e-4   # Normal LR for decoder
+    freeze_encoder = False  # Do NOT freeze (low LR is better)
 
 # ==============================================================================
 # Excluded Samples (all-zero target images)
@@ -727,11 +734,71 @@ def create_model(config):
         
         attention_str = f" + {decoder_attention} attention" if decoder_attention else ""
         print(f"Using SMP {arch_name} ({config.encoder}{attention_str}) with sigmoid activation")
+        
+        # exp_027: Load VirtualStaining pretrained encoder weights
+        model = _load_transfer_weights(model, config)
+        
     except ImportError:
         model = SimpleUNet(config.in_channels, config.out_channels)
         print("Using Simple U-Net (SMP not available) with sigmoid activation")
     
     return model.to(config.device)
+
+
+def _load_transfer_weights(model, config):
+    """exp_027: Load VirtualStaining encoder weights for transfer learning."""
+    import os
+    
+    transfer_enabled = getattr(config, 'transfer_learning_enabled', False)
+    pretrained_path = getattr(config, 'pretrained_encoder_path', None)
+    
+    if not transfer_enabled or not pretrained_path:
+        return model
+    
+    if not os.path.exists(pretrained_path):
+        print(f"⚠️ Transfer learning: pretrained file not found: {pretrained_path}")
+        return model
+    
+    print(f"\n{'='*60}")
+    print("exp_027: Loading VirtualStaining Encoder Weights")
+    print("="*60)
+    
+    checkpoint = torch.load(pretrained_path, map_location='cpu')
+    
+    # Extract encoder weights
+    encoder_weights = {k: v for k, v in checkpoint.items() if 'encoder' in k.lower()}
+    print(f"  Found {len(encoder_weights)} encoder parameters in checkpoint")
+    
+    # Load encoder weights
+    current_state = model.encoder.state_dict()
+    loaded_count = 0
+    for key, value in encoder_weights.items():
+        clean_key = key.replace('encoder.', '')
+        if clean_key in current_state and current_state[clean_key].shape == value.shape:
+            current_state[clean_key] = value
+            loaded_count += 1
+    
+    model.encoder.load_state_dict(current_state)
+    print(f"  Loaded {loaded_count} encoder layers from VirtualStaining")
+    
+    # Reset BatchNorm statistics
+    bn_count = 0
+    for module in model.modules():
+        if isinstance(module, (nn.BatchNorm2d, nn.BatchNorm1d)):
+            module.reset_running_stats()
+            bn_count += 1
+    print(f"  Reset {bn_count} BatchNorm layers")
+    
+    # Freeze encoder if requested (not recommended)
+    if getattr(config, 'freeze_encoder', False):
+        for param in model.encoder.parameters():
+            param.requires_grad = False
+        print("  ⚠️ Encoder frozen (not recommended)")
+    else:
+        print("  Encoder will be fine-tuned with low LR")
+    
+    print("="*60 + "\n")
+    return model
 
 
 # ==============================================================================
