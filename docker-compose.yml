@@ -18,3 +18,24 @@ services:
       - ./medical-ai-contest-7th-2025:/app/medical-ai-contest-7th-2025:ro
       - ./outputs:/app/outputs
     command: python src/train.py --quick-check --batch-size 4 --image-size 256
+
+  virtualstaining:
+    build: .
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+    volumes:
+      - ./data:/app/data:ro
+      - ./src:/app/src:ro
+      - ./outputs:/app/outputs
+    command: python src/train_virtualstaining.py --data-dir "data/VirtualStaining/2022-09-06 Dataset Update" --epochs 50 --batch-size 4 --mse-weight 1.0 --ssim-weight 1.0
+
+  virtualstaining-cpu:
+    build:
+      context: .
+      dockerfile: Dockerfile.cpu
+    volumes:
+      - ./data:/app/data:ro
+      - ./src:/app/src:ro
+      - ./outputs:/app/outputs
+    command: python src/train_virtualstaining.py --data-dir "data/VirtualStaining/2022-09-06 Dataset Update" --epochs 50 --batch-size 2
