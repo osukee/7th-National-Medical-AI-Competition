@@ -153,6 +153,11 @@ class Config:
     encoder_lr = 1e-5   # Low LR for encoder (fine-tune)
     decoder_lr = 1e-4   # Normal LR for decoder
     freeze_encoder = False  # Do NOT freeze (low LR is better)
+    
+    # exp_028: CLAHE preprocessing (match VirtualStaining)
+    clahe_enabled = True
+    clahe_clip_limit = 2.0
+    clahe_tile_size = (8, 8)
 
 # ==============================================================================
 # Excluded Samples (all-zero target images)
@@ -552,6 +557,11 @@ class OrganoidDataset(Dataset):
         # exp_022: Augmentation pipeline (training only)
         self.augmentation = augmentation
         
+        # exp_028: CLAHE preprocessing (match VirtualStaining)
+        self.clahe_enabled = getattr(Config, 'clahe_enabled', False)
+        self.clahe_clip_limit = getattr(Config, 'clahe_clip_limit', 2.0)
+        self.clahe_tile_size = getattr(Config, 'clahe_tile_size', (8, 8))
+        
     def __len__(self):
         return len(self.df)
     
@@ -563,7 +573,18 @@ class OrganoidDataset(Dataset):
         input_path = self.data_dir / row["input_path"]
         input_img = Image.open(input_path).convert("L")
         input_img = input_img.resize((self.image_size, self.image_size), Image.BILINEAR)
-        input_arr = np.array(input_img, dtype=np.float32) / 255.0
+        input_arr = np.array(input_img, dtype=np.uint8)
+        
+        # exp_028: Apply CLAHE preprocessing
+        if self.clahe_enabled:
+            import cv2
+            clahe = cv2.createCLAHE(
+                clipLimit=self.clahe_clip_limit,
+                tileGridSize=self.clahe_tile_size
+            )
+            input_arr = clahe.apply(input_arr)
+        
+        input_arr = input_arr.astype(np.float32) / 255.0
         
         if self.is_test:
             input_tensor = torch.from_numpy(input_arr).unsqueeze(0)
