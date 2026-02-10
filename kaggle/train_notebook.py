@@ -48,6 +48,7 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from PIL import Image
 from skimage.metrics import structural_similarity as ssim
@@ -147,15 +148,20 @@ class Config:
     tracking_enabled = True
     tracking_project = "medical-ai-7th"
     
-    # exp_027: VirtualStaining Transfer Learning
-    transfer_learning_enabled = True
-    pretrained_encoder_path = "/kaggle/input/virtualstaining-pretrained/best_model.pth"
-    encoder_lr = 1e-5   # Low LR for encoder (fine-tune)
+    # exp_029: SimCLR Self-Supervised Pretraining (ルール適合)
+    # Phase 1: Contrastive learning on input images only (no labels)
+    # Phase 2: Fine-tune with pretrained encoder
+    simclr_enabled = True
+    simclr_epochs = 50       # SimCLR pretraining epochs
+    simclr_batch_size = 32   # SimCLR batch size
+    simclr_lr = 3e-4         # SimCLR learning rate
+    simclr_temperature = 0.5 # NT-Xent temperature
+    simclr_projection_dim = 128
+    encoder_lr = 1e-5   # Low LR for pretrained encoder (fine-tune)
     decoder_lr = 1e-4   # Normal LR for decoder
-    freeze_encoder = False  # Do NOT freeze (low LR is better)
     
-    # exp_028: CLAHE preprocessing (match VirtualStaining)
-    clahe_enabled = True
+    # CLAHE preprocessing
+    clahe_enabled = False
     clahe_clip_limit = 2.0
     clahe_tile_size = (8, 8)
 
@@ -766,58 +772,199 @@ def create_model(config):
     return model.to(config.device)
 
 
+# ==============================================================================
+# SimCLR Self-Supervised Pretraining (ルール適合)
+# ==============================================================================
+
+class SimCLRAugmentation:
+    """SimCLR augmentation for medical images."""
+    def __init__(self, size=512):
+        self.size = size
+    
+    def __call__(self, img):
+        import cv2
+        h, w = img.shape[:2]
+        scale = np.random.uniform(0.8, 1.0)
+        new_h, new_w = int(h * scale), int(w * scale)
+        top = np.random.randint(0, max(1, h - new_h + 1))
+        left = np.random.randint(0, max(1, w - new_w + 1))
+        img = img[top:top+new_h, left:left+new_w]
+        img = cv2.resize(img, (self.size, self.size))
+        if np.random.random() > 0.5:
+            img = np.fliplr(img).copy()
+        if np.random.random() > 0.5:
+            img = np.flipud(img).copy()
+        k = np.random.randint(0, 4)
+        img = np.rot90(img, k).copy()
+        if np.random.random() > 0.5:
+            ksize = np.random.choice([3, 5, 7])
+            img = cv2.GaussianBlur(img, (ksize, ksize), 0)
+        alpha = np.random.uniform(0.8, 1.2)
+        beta = np.random.uniform(-0.1, 0.1)
+        img = np.clip(alpha * img + beta, 0, 1)
+        return img.astype(np.float32)
+
+
+class SimCLRDataset(Dataset):
+    """Dataset for SimCLR: input images only, NO labels."""
+    def __init__(self, data_dir, image_size=512):
+        self.data_dir = Path(data_dir)
+        self.size = image_size
+        self.augment = SimCLRAugmentation(image_size)
+        self.paths = []
+        
+        # Collect train + test input images
+        for csv_name in ["train.csv", "test.csv"]:
+            csv_path = self.data_dir / csv_name
+            if csv_path.exists():
+                df = pd.read_csv(csv_path)
+                for p in df['input_path']:
+                    full = self.data_dir / p
+                    if full.exists():
+                        self.paths.append(full)
+        print(f"SimCLR Dataset: {len(self.paths)} images")
+    
+    def __len__(self):
+        return len(self.paths)
+    
+    def __getitem__(self, idx):
+        img = Image.open(self.paths[idx]).convert('L')
+        img = img.resize((self.size, self.size), Image.BILINEAR)
+        img = np.array(img, dtype=np.float32) / 255.0
+        v1 = torch.from_numpy(self.augment(img)).unsqueeze(0)
+        v2 = torch.from_numpy(self.augment(img)).unsqueeze(0)
+        return v1, v2
+
+
+class NTXentLoss(nn.Module):
+    """NT-Xent contrastive loss."""
+    def __init__(self, temperature=0.5):
+        super().__init__()
+        self.temp = temperature
+    
+    def forward(self, z1, z2):
+        N = z1.shape[0]
+        z = torch.cat([z1, z2], dim=0)
+        sim = torch.mm(z, z.t()) / self.temp
+        mask = torch.eye(2*N, device=z.device).bool()
+        sim.masked_fill_(mask, -1e9)
+        labels = torch.cat([torch.arange(N) + N, torch.arange(N)]).to(z.device)
+        return F.cross_entropy(sim, labels)
+
+
+def run_simclr_pretrain(config):
+    """
+    Phase 1: SimCLR self-supervised pretraining.
+    Uses ONLY input images (no labels). Rule-compliant.
+    Returns path to saved encoder weights.
+    """
+    import segmentation_models_pytorch as smp
+    
+    simclr_path = config.output_dir / "simclr_encoder.pth"
+    
+    if not getattr(config, 'simclr_enabled', False):
+        return None
+    
+    print(f"\n{'='*60}")
+    print("Phase 1: SimCLR Self-Supervised Pretraining")
+    print(f"{'='*60}")
+    
+    dataset = SimCLRDataset(config.data_dir, config.image_size)
+    if len(dataset) == 0:
+        print("⚠️ No images found for SimCLR, skipping")
+        return None
+    
+    loader = DataLoader(
+        dataset, batch_size=config.simclr_batch_size,
+        shuffle=True, num_workers=config.num_workers,
+        drop_last=True, pin_memory=True
+    )
+    
+    # Build encoder + projection head
+    encoder = smp.encoders.get_encoder(
+        name=config.encoder, in_channels=config.in_channels, weights=None
+    )
+    enc_dim = encoder.out_channels[-1]
+    pool = nn.AdaptiveAvgPool2d(1)
+    proj = nn.Sequential(
+        nn.Linear(enc_dim, 512), nn.ReLU(),
+        nn.Linear(512, config.simclr_projection_dim)
+    )
+    
+    encoder = encoder.to(config.device)
+    pool = pool.to(config.device)
+    proj = proj.to(config.device)
+    
+    criterion = NTXentLoss(config.simclr_temperature)
+    all_params = list(encoder.parameters()) + list(proj.parameters())
+    optimizer = optim.AdamW(all_params, lr=config.simclr_lr)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, config.simclr_epochs)
+    
+    best_loss = float('inf')
+    for epoch in range(config.simclr_epochs):
+        encoder.train(); proj.train()
+        total_loss = 0
+        for v1, v2 in loader:
+            v1, v2 = v1.to(config.device), v2.to(config.device)
+            f1 = pool(encoder(v1)[-1]).flatten(1)
+            f2 = pool(encoder(v2)[-1]).flatten(1)
+            z1 = F.normalize(proj(f1), dim=1)
+            z2 = F.normalize(proj(f2), dim=1)
+            loss = criterion(z1, z2)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+        
+        avg_loss = total_loss / len(loader)
+        scheduler.step()
+        
+        if (epoch + 1) % 10 == 0 or epoch == 0:
+            print(f"  SimCLR Epoch {epoch+1}/{config.simclr_epochs}: Loss = {avg_loss:.4f}")
+        
+        if avg_loss < best_loss:
+            best_loss = avg_loss
+            torch.save(encoder.state_dict(), simclr_path)
+    
+    print(f"SimCLR complete! Best loss: {best_loss:.4f}")
+    print(f"Encoder saved: {simclr_path}")
+    return simclr_path
+
+
 def _load_transfer_weights(model, config):
-    """exp_027: Load VirtualStaining encoder weights for transfer learning."""
-    import os
+    """exp_029: Load SimCLR pretrained encoder weights."""
+    simclr_path = config.output_dir / "simclr_encoder.pth"
     
-    transfer_enabled = getattr(config, 'transfer_learning_enabled', False)
-    pretrained_path = getattr(config, 'pretrained_encoder_path', None)
-    
-    if not transfer_enabled or not pretrained_path:
+    if not getattr(config, 'simclr_enabled', False):
         return model
     
-    if not os.path.exists(pretrained_path):
-        print(f"⚠️ Transfer learning: pretrained file not found: {pretrained_path}")
+    if not simclr_path.exists():
+        print("⚠️ SimCLR encoder not found, using default weights")
         return model
     
     print(f"\n{'='*60}")
-    print("exp_027: Loading VirtualStaining Encoder Weights")
+    print("exp_029: Loading SimCLR Pretrained Encoder")
     print("="*60)
     
-    checkpoint = torch.load(pretrained_path, map_location='cpu')
-    
-    # Extract encoder weights
-    encoder_weights = {k: v for k, v in checkpoint.items() if 'encoder' in k.lower()}
-    print(f"  Found {len(encoder_weights)} encoder parameters in checkpoint")
-    
-    # Load encoder weights
+    simclr_weights = torch.load(simclr_path, map_location='cpu')
     current_state = model.encoder.state_dict()
-    loaded_count = 0
-    for key, value in encoder_weights.items():
-        clean_key = key.replace('encoder.', '')
-        if clean_key in current_state and current_state[clean_key].shape == value.shape:
-            current_state[clean_key] = value
-            loaded_count += 1
+    loaded = 0
+    for key, value in simclr_weights.items():
+        if key in current_state and current_state[key].shape == value.shape:
+            current_state[key] = value
+            loaded += 1
     
     model.encoder.load_state_dict(current_state)
-    print(f"  Loaded {loaded_count} encoder layers from VirtualStaining")
+    print(f"  Loaded {loaded} encoder layers from SimCLR")
     
-    # Reset BatchNorm statistics
-    bn_count = 0
-    for module in model.modules():
-        if isinstance(module, (nn.BatchNorm2d, nn.BatchNorm1d)):
-            module.reset_running_stats()
-            bn_count += 1
-    print(f"  Reset {bn_count} BatchNorm layers")
-    
-    # Freeze encoder if requested (not recommended)
-    if getattr(config, 'freeze_encoder', False):
-        for param in model.encoder.parameters():
-            param.requires_grad = False
-        print("  ⚠️ Encoder frozen (not recommended)")
-    else:
-        print("  Encoder will be fine-tuned with low LR")
-    
+    # Reset BatchNorm
+    bn = 0
+    for m in model.modules():
+        if isinstance(m, (nn.BatchNorm2d, nn.BatchNorm1d)):
+            m.reset_running_stats()
+            bn += 1
+    print(f"  Reset {bn} BatchNorm layers")
+    print(f"  Encoder will be fine-tuned with low LR")
     print("="*60 + "\n")
     return model
 
@@ -2892,7 +3039,10 @@ if __name__ == "__main__":
     print(f"CV Mode: {cv_mode}")
     print(f"Run Inference: {run_inference}")
     
-    # Training
+    # Phase 1: SimCLR Self-Supervised Pretraining (ルール適合)
+    run_simclr_pretrain(config)
+    
+    # Phase 2: Supervised Training with pretrained encoder
     if cv_mode == "worst_case_v5":
         train_worst_case_cv_v5(config, n_folds=n_folds)
     elif cv_mode == "worst_case":
