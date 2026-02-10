@@ -3040,7 +3040,11 @@ if __name__ == "__main__":
     print(f"Run Inference: {run_inference}")
     
     # Phase 1: SimCLR Self-Supervised Pretraining (ルール適合)
-    run_simclr_pretrain(config)
+    try:
+        run_simclr_pretrain(config)
+    except Exception as e:
+        print(f"⚠️ SimCLR pretraining failed: {e}")
+        print("Continuing with ImageNet weights...")
     
     # Phase 2: Supervised Training with pretrained encoder
     if cv_mode == "worst_case_v5":
