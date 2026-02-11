@@ -153,7 +153,8 @@ class Config:
     # Phase 2: Fine-tune with pretrained encoder
     simclr_enabled = True
     simclr_epochs = 50       # SimCLR pretraining epochs
-    simclr_batch_size = 32   # SimCLR batch size
+    simclr_batch_size = 8    # Small batch for T4 GPU (16GB)
+    simclr_image_size = 256  # Smaller images for SimCLR (save VRAM)
     simclr_lr = 3e-4         # SimCLR learning rate
     simclr_temperature = 0.5 # NT-Xent temperature
     simclr_projection_dim = 128
@@ -869,7 +870,8 @@ def run_simclr_pretrain(config):
     print("Phase 1: SimCLR Self-Supervised Pretraining")
     print(f"{'='*60}")
     
-    dataset = SimCLRDataset(config.data_dir, config.image_size)
+    simclr_size = getattr(config, 'simclr_image_size', config.image_size)
+    dataset = SimCLRDataset(config.data_dir, simclr_size)
     if len(dataset) == 0:
         print("⚠️ No images found for SimCLR, skipping")
         return None
