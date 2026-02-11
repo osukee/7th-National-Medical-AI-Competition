@@ -38,10 +38,70 @@ import segmentation_models_pytorch as smp
 print(f"PyTorch: {torch.__version__}")
 print(f"CUDA: {torch.cuda.is_available()}")
 
+# %% Setup data - works on both Kaggle and Colab
+import os
+
+def setup_data_directory():
+    """
+    Setup data directory for both Kaggle and Colab environments.
+    """
+    # Check if running on Kaggle
+    kaggle_input = Path("/kaggle/input")
+    if kaggle_input.exists() and list(kaggle_input.iterdir()):
+        print("Running on Kaggle")
+        for d in kaggle_input.iterdir():
+            if d.is_dir() and (d / "train.csv").exists():
+                print(f"✓ Found data in: {d}")
+                return d
+    
+    # Check if running on Colab
+    if os.path.exists("/content"):
+        print("Running on Google Colab")
+        
+        # Option 1: Check if data already exists
+        colab_data = Path("/content/data")
+        if colab_data.exists() and (colab_data / "train.csv").exists():
+            print(f"✓ Data already exists in: {colab_data}")
+            return colab_data
+        
+        # Option 2: Download from Kaggle API
+        print("Downloading data from Kaggle API...")
+        print("Please ensure you have uploaded kaggle.json to Colab!")
+        
+        # Setup Kaggle credentials
+        os.makedirs("/root/.kaggle", exist_ok=True)
+        if os.path.exists("/content/kaggle.json"):
+            import shutil
+            shutil.copy("/content/kaggle.json", "/root/.kaggle/kaggle.json")
+            os.chmod("/root/.kaggle/kaggle.json", 0o600)
+        
+        # Download competition data
+        os.makedirs("/content/data", exist_ok=True)
+        os.system("pip install -q kaggle")
+        result = os.system("kaggle competitions download -c medical-ai-contest-7th-2025 -p /content/data")
+        
+        if result == 0:
+            # Unzip if needed
+            os.system("cd /content/data && unzip -q -o '*.zip' 2>/dev/null || true")
+            print("✓ Downloaded and extracted data")
+            return Path("/content/data")
+        else:
+            print("⚠️ Kaggle download failed!")
+            print("Please:")
+            print("1. Go to kaggle.com -> Settings -> Create New API Token")
+            print("2. Upload the downloaded kaggle.json to Colab")
+            print("3. Re-run this cell")
+            raise RuntimeError("Data not available. Please upload kaggle.json first.")
+    
+    raise RuntimeError("Unknown environment. Please run on Kaggle or Colab.")
+
+DETECTED_DATA_DIR = setup_data_directory()
+print(f"Using data directory: {DETECTED_DATA_DIR}")
+
 # %% Configuration
 class Config:
-    # Kaggle paths
-    data_dir = Path("/kaggle/input/medical-ai-contest-7th-2025")
+    # Kaggle paths - auto-detected
+    data_dir = DETECTED_DATA_DIR
     output_dir = Path("/kaggle/working")
     
     image_size = 512
@@ -110,20 +170,62 @@ class SimCLRDataset(Dataset):
         self.size = size
         self.augment = SimCLRAugmentation(size)
         
+        # Debug: Print data directory contents
+        print(f"Looking for data in: {self.data_dir}")
+        if self.data_dir.exists():
+            print(f"Contents: {list(self.data_dir.iterdir())[:10]}")
+        else:
+            print(f"Directory does not exist! Searching...")
+            # Try to find the correct path in Kaggle
+            import os
+            for root, dirs, files in os.walk("/kaggle/input"):
+                if "train.csv" in files:
+                    self.data_dir = Path(root)
+                    print(f"Found data at: {self.data_dir}")
+                    break
+        
         # Collect ALL input images (train + test)
         self.paths = []
         
         train_csv = self.data_dir / "train.csv"
+        print(f"Train CSV exists: {train_csv.exists()}")
         if train_csv.exists():
             df = pd.read_csv(train_csv)
-            self.paths.extend([self.data_dir / p for p in df['input_path']])
+            print(f"Train CSV columns: {df.columns.tolist()}")
+            print(f"Train CSV rows: {len(df)}")
+            
+            # Debug: show first few input_path values
+            if 'input_path' in df.columns:
+                print(f"First input_path: {df['input_path'].iloc[0]}")
+                first_path = self.data_dir / df['input_path'].iloc[0]
+                print(f"Full path would be: {first_path}")
+                print(f"That path exists: {first_path.exists()}")
+                
+                # List directory contents to find actual images
+                print(f"Data dir contents: {list(self.data_dir.iterdir())[:5]}")
+            else:
+                print(f"WARNING: 'input_path' column not found!")
+                print(f"Available columns: {df.columns.tolist()}")
+            
+            for p in df['input_path']:
+                full_path = self.data_dir / p
+                if full_path.exists():
+                    self.paths.append(full_path)
+            print(f"Valid train paths: {len(self.paths)}")
         
         test_csv = self.data_dir / "test.csv"
+        print(f"Test CSV exists: {test_csv.exists()}")
         if test_csv.exists():
             df = pd.read_csv(test_csv)
-            self.paths.extend([self.data_dir / p for p in df['input_path']])
+            for p in df['input_path']:
+                full_path = self.data_dir / p
+                if full_path.exists():
+                    self.paths.append(full_path)
         
-        print(f"SimCLR: {len(self.paths)} images")
+        print(f"SimCLR Dataset: {len(self.paths)} images total")
+        
+        if len(self.paths) == 0:
+            print("WARNING: No images found! Check your data paths.")
     
     def __len__(self):
         return len(self.paths)
