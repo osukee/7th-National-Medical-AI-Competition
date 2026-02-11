@@ -151,7 +151,7 @@ class Config:
     # exp_029: SimCLR Self-Supervised Pretraining (ルール適合)
     # Phase 1: Contrastive learning on input images only (no labels)
     # Phase 2: Fine-tune with pretrained encoder
-    simclr_enabled = True
+    simclr_enabled = False  # Disabled: T4 GPU batch too small for effective contrastive learning
     simclr_epochs = 50       # SimCLR pretraining epochs
     simclr_batch_size = 8    # Small batch for T4 GPU (16GB)
     simclr_image_size = 256  # Smaller images for SimCLR (save VRAM)
