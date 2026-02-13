@@ -73,7 +73,7 @@ class Config:
     
     # Training
     epochs = 25  # exp_030: More epochs for better convergence
-    batch_size = 8
+    batch_size = 4  # exp_030: Reduced for b5 (larger encoder needs more VRAM)
     learning_rate = 1e-4
     weight_decay = 1e-5
     num_workers = 2
@@ -98,6 +98,7 @@ class Config:
     # Model - exp_016: Upgrade to efficientnet-b4 for better feature extraction
     encoder = "efficientnet-b5"  # exp_030: Larger encoder for better features
     encoder_weights = "imagenet"
+    gradient_checkpointing = True  # exp_030: Save VRAM with b5
     
     # Architecture selection
     # Options: "unet", "unetplusplus" (U-Net++)
@@ -773,11 +774,30 @@ def create_model(config):
         # exp_027: Load VirtualStaining pretrained encoder weights
         model = _load_transfer_weights(model, config)
         
+        # exp_030: Gradient checkpointing to save VRAM with larger encoders
+        if getattr(config, 'gradient_checkpointing', False):
+            try:
+                from torch.utils.checkpoint import checkpoint
+                # Enable gradient checkpointing on encoder
+                if hasattr(model.encoder, 'set_grad_checkpointing'):
+                    model.encoder.set_grad_checkpointing(True)
+                    print("Gradient checkpointing enabled (encoder)")
+                else:
+                    # Fallback: enable on all modules that support it
+                    for module in model.encoder.modules():
+                        if hasattr(module, 'gradient_checkpointing'):
+                            module.gradient_checkpointing = True
+                    print("Gradient checkpointing enabled (module-level)")
+            except Exception as e:
+                print(f"Warning: Could not enable gradient checkpointing: {e}")
+        
     except ImportError:
         model = SimpleUNet(config.in_channels, config.out_channels)
         print("Using Simple U-Net (SMP not available) with sigmoid activation")
     
-    return model.to(config.device)
+    model = model.to(config.device)
+    torch.cuda.empty_cache()  # exp_030: Free fragmented VRAM after model load
+    return model
 
 
 def _load_transfer_weights(model, config):
