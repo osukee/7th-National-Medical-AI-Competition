@@ -72,7 +72,7 @@ class Config:
     out_channels = 1
     
     # Training
-    epochs = 15  # SMP U-Net with more epochs for convergence
+    epochs = 25  # exp_030: More epochs for better convergence
     batch_size = 8
     learning_rate = 1e-4
     weight_decay = 1e-5
@@ -96,7 +96,7 @@ class Config:
     loss_type = "edge_weighted"
     
     # Model - exp_016: Upgrade to efficientnet-b4 for better feature extraction
-    encoder = "efficientnet-b4"
+    encoder = "efficientnet-b5"  # exp_030: Larger encoder for better features
     encoder_weights = "imagenet"
     
     # Architecture selection
@@ -116,21 +116,21 @@ class Config:
     # exp_018: Test Time Augmentation (TTA)
     # Predict with original + horizontal flip + vertical flip + both, average results
     tta_enabled = True  # Enable TTA for inference
-    tta_mode = "flip4"  # "flip4" (default) or "dihedral8"
+    tta_mode = "dihedral8"  # exp_030: 8-way TTA (90° rotations + flips)
     tta_aggregate = "median"  # "median" or "mean"
     
     # exp_022/023: Data Augmentation (training only)
     # exp_022 failed because brightness/contrast broke input-target correspondence
     # exp_023: Redesigned to use geometric-only transforms
     augmentation_enabled = True  # Enable data augmentation during training
-    augmentation_strength = 0.5  # Probability for augmentations (0.3=weak, 0.5=medium, 0.7=strong)
+    augmentation_strength = 0.6  # exp_030: Slightly stronger augmentation
     augmentation_mode = 'geometric'  # 'geometric' (safe) or 'intensity' (deprecated)
     
     # exp_025: Fold Selection Ensemble
     # Select top N folds by SSIM (reject weak folds to reduce noise)
     # rank-based weights instead of softmax (preserves differentiation)
-    n_folds_ensemble = 3              # Use top 3 folds only
-    fold_rank_weights = [1.0, 0.7, 0.4]  # Weights by rank (best, mid, low)
+    n_folds_ensemble = 5              # exp_030: Use all 5 folds
+    fold_rank_weights = [1.0, 0.9, 0.8, 0.7, 0.6]  # exp_030: Gradual decay weights
     
     # Post-processing options (Phase A quick wins)
     median_filter_size = 0    # 0=disabled, 3=3x3 median (salt-pepper removal)
@@ -148,7 +148,7 @@ class Config:
     tracking_project = "medical-ai-7th"
     
     # exp_027: VirtualStaining Transfer Learning
-    transfer_learning_enabled = True
+    transfer_learning_enabled = False  # exp_030: Disabled (VirtualStaining was rule violation)
     pretrained_encoder_path = "/kaggle/input/virtualstaining-pretrained/best_model.pth"
     encoder_lr = 1e-5   # Low LR for encoder (fine-tune)
     decoder_lr = 1e-4   # Normal LR for decoder
@@ -158,6 +158,12 @@ class Config:
     clahe_enabled = True
     clahe_clip_limit = 2.0
     clahe_tile_size = (8, 8)
+    
+    # exp_030: Pseudo-Labeling
+    pseudo_label_enabled = True
+    pseudo_label_epochs = 10       # Phase 2 fine-tuning epochs
+    pseudo_label_weight = 0.5      # Loss weight for pseudo-labeled samples (vs 1.0 for real)
+    pseudo_label_lr_factor = 0.3   # LR = learning_rate * factor for Phase 2
 
 # ==============================================================================
 # Excluded Samples (all-zero target images)
@@ -506,6 +512,14 @@ def get_training_augmentation(strength=0.5, mode='geometric'):
                 sigma=5,               # Smoothness of deformation
                 border_mode=0,
                 p=strength * 0.3       # Use sparingly
+            ),
+            
+            # exp_030: GridDistortion - simulates organoid boundary diversity
+            A.GridDistortion(
+                num_steps=5,
+                distort_limit=0.1,
+                border_mode=0,
+                p=strength * 0.2
             ),
         ], additional_targets={'target': 'image', 'mask': 'mask'})
     
@@ -2587,6 +2601,374 @@ def train_worst_case_cv_v5(config, n_folds=5):
 
 
 # ==============================================================================
+# Pseudo-Labeling Pipeline (exp_030)
+# ==============================================================================
+
+def generate_pseudo_labels(config):
+    """
+    Generate pseudo-labels for test data using Phase 1 fold ensemble.
+    
+    Process:
+    1. Load all fold models from Phase 1
+    2. For each test image: TTA + weighted fold ensemble prediction
+    3. Return predictions as numpy arrays (H, W) float32 [0, 1]
+    """
+    print(f"\n{'='*60}")
+    print("Generating Pseudo-Labels for Test Data")
+    print(f"{'='*60}")
+    
+    import cv2
+    
+    # Load fold models
+    cv_results_path = config.output_dir / "cv_results.json"
+    if not cv_results_path.exists():
+        print("ERROR: cv_results.json not found. Cannot generate pseudo-labels.")
+        return None
+    
+    with open(cv_results_path, 'r') as f:
+        cv_results = json.load(f)
+    
+    fold_results = cv_results.get('fold_results', [])
+    fold_data = []
+    for fold_result in fold_results:
+        fold_idx = fold_result['fold'] - 1
+        fold_ssim = fold_result['ssim']
+        fold_model_path = config.output_dir / f"best_model_fold{fold_idx}.pth"
+        if fold_model_path.exists():
+            fold_data.append({'idx': fold_idx, 'ssim': fold_ssim, 'path': fold_model_path})
+    
+    if not fold_data:
+        print("ERROR: No fold models found.")
+        return None
+    
+    # Sort by SSIM and use rank-based weights
+    fold_data.sort(key=lambda x: x['ssim'], reverse=True)
+    rank_weights = getattr(config, 'fold_rank_weights', [1.0, 0.9, 0.8, 0.7, 0.6])
+    weights = np.array(rank_weights[:len(fold_data)])
+    weights = weights / weights.sum()
+    
+    print(f"Using {len(fold_data)} fold models for pseudo-label generation:")
+    for i, fd in enumerate(fold_data):
+        print(f"  Fold {fd['idx']}: SSIM={fd['ssim']:.4f}, weight={weights[i]:.3f}")
+    
+    # Load models
+    models = []
+    for fd in fold_data:
+        model = create_model(config)
+        model.load_state_dict(torch.load(fd['path'], map_location=config.device))
+        model.eval()
+        models.append(model)
+    
+    # Load test data
+    test_df = pd.read_csv(config.test_csv)
+    test_dataset = OrganoidDataset(test_df, config.data_dir, config.image_size, is_test=True)
+    test_loader = DataLoader(test_dataset, batch_size=config.batch_size, shuffle=False, num_workers=config.num_workers)
+    
+    pseudo_labels = {}  # id -> numpy array (H, W) float32 [0, 1]
+    
+    with torch.no_grad():
+        for batch in tqdm(test_loader, desc="Generating pseudo-labels"):
+            inputs = batch["input"].to(config.device)
+            ids = batch["id"]
+            
+            # Ensemble prediction with TTA
+            ensemble_preds = []
+            for model in models:
+                tta_mode = getattr(config, 'tta_mode', "flip4")
+                tta_aggregate = getattr(config, 'tta_aggregate', "median")
+                pred = predict_with_tta(model, inputs, config.device, mode=tta_mode, aggregate=tta_aggregate)
+                pred = torch.clamp(pred, 0, 1)
+                ensemble_preds.append(pred)
+            
+            # Weighted average across folds
+            stacked = torch.stack(ensemble_preds, dim=0)
+            weights_tensor = torch.tensor(weights, device=config.device, dtype=torch.float32)
+            weights_tensor = weights_tensor.view(-1, 1, 1, 1, 1)
+            final_pred = (stacked * weights_tensor).sum(dim=0)
+            
+            for i, sample_id in enumerate(ids):
+                pseudo_labels[sample_id] = final_pred[i, 0].cpu().numpy()
+    
+    print(f"Generated pseudo-labels for {len(pseudo_labels)} test samples")
+    
+    # Cleanup models to free GPU memory
+    del models
+    torch.cuda.empty_cache()
+    
+    return pseudo_labels
+
+
+class PseudoLabelDataset(Dataset):
+    """Dataset that combines real training data with pseudo-labeled test data."""
+    
+    def __init__(self, real_df, pseudo_df, data_dir, image_size, pseudo_labels,
+                 pseudo_weight=0.5, augmentation=None):
+        """
+        Args:
+            real_df: DataFrame of real training samples
+            pseudo_df: DataFrame of test samples (for input images)
+            data_dir: Path to data directory
+            image_size: Target image size
+            pseudo_labels: dict of {sample_id: numpy array (H, W) float32 [0, 1]}
+            pseudo_weight: Loss weight for pseudo-labeled samples
+            augmentation: Albumentations augmentation pipeline
+        """
+        self.data_dir = Path(data_dir)
+        self.image_size = image_size
+        self.augmentation = augmentation
+        
+        # Build combined sample list
+        self.samples = []
+        
+        # Real samples (weight = 1.0) — store CSV row for correct path resolution
+        for _, row in real_df.iterrows():
+            self.samples.append({
+                'id': row['id'],
+                'input_path': row['input_path'],       # e.g. "train/train_00000.png"
+                'target_path': row.get('target_path'),  # e.g. "train/train_00000_target.png"
+                'mask_path': row.get('mask_path'),      # e.g. "train/train_00000_mask.png"
+                'is_pseudo': False,
+                'weight': 1.0,
+            })
+        
+        # Pseudo samples (weight = pseudo_weight) — use CSV input_path from test.csv
+        for _, row in pseudo_df.iterrows():
+            sample_id = row['id']
+            if sample_id in pseudo_labels:
+                self.samples.append({
+                    'id': sample_id,
+                    'input_path': row['input_path'],    # e.g. "test/test_00000.png"
+                    'target_path': None,                # pseudo-labeled (no ground truth)
+                    'mask_path': None,
+                    'is_pseudo': True,
+                    'weight': pseudo_weight,
+                    'pseudo_target': pseudo_labels[sample_id],
+                })
+        
+        # CLAHE config
+        self.clahe_enabled = getattr(Config, 'clahe_enabled', True)
+        self.clahe_clip_limit = getattr(Config, 'clahe_clip_limit', 2.0)
+        self.clahe_tile_size = getattr(Config, 'clahe_tile_size', (8, 8))
+        
+        print(f"PseudoLabelDataset: {sum(1 for s in self.samples if not s['is_pseudo'])} real + "
+              f"{sum(1 for s in self.samples if s['is_pseudo'])} pseudo = {len(self.samples)} total")
+    
+    def __len__(self):
+        return len(self.samples)
+    
+    def __getitem__(self, idx):
+        sample = self.samples[idx]
+        sample_id = sample['id']
+        
+        # Load input image using CSV path (matches OrganoidDataset behavior)
+        input_path = self.data_dir / sample['input_path']
+        
+        img = np.array(Image.open(input_path).convert('L'))
+        
+        # CLAHE preprocessing
+        if self.clahe_enabled:
+            import cv2
+            clahe = cv2.createCLAHE(
+                clipLimit=self.clahe_clip_limit,
+                tileGridSize=self.clahe_tile_size
+            )
+            img = clahe.apply(img)
+        
+        # Resize if needed
+        if img.shape[0] != self.image_size or img.shape[1] != self.image_size:
+            import cv2
+            img = cv2.resize(img, (self.image_size, self.image_size))
+        
+        # Get target
+        if sample['is_pseudo']:
+            target = (sample['pseudo_target'] * 255).astype(np.uint8)
+        else:
+            # Use CSV target_path (e.g. "train/train_00000_target.png")
+            target_path = self.data_dir / sample['target_path']
+            target = np.array(Image.open(target_path).convert('L'))
+            if target.shape[0] != self.image_size or target.shape[1] != self.image_size:
+                import cv2
+                target = cv2.resize(target, (self.image_size, self.image_size))
+        
+        # Load mask using CSV mask_path
+        mask = None
+        if sample['mask_path'] and pd.notna(sample['mask_path']):
+            mask_path = self.data_dir / sample['mask_path']
+            if mask_path.exists():
+                mask = np.array(Image.open(mask_path).convert('L'))
+                if mask.shape[0] != self.image_size or mask.shape[1] != self.image_size:
+                    import cv2
+                    mask = cv2.resize(mask, (self.image_size, self.image_size))
+        if mask is None:
+            mask = np.ones((self.image_size, self.image_size), dtype=np.uint8) * 255
+        
+        # Apply augmentation
+        if self.augmentation is not None:
+            augmented = self.augmentation(image=img, target=target, mask=mask)
+            img = augmented['image']
+            target = augmented['target']
+            mask = augmented['mask']
+        
+        # Convert to tensors
+        img_tensor = torch.from_numpy(img.astype(np.float32) / 255.0).unsqueeze(0)
+        target_tensor = torch.from_numpy(target.astype(np.float32) / 255.0).unsqueeze(0)
+        mask_tensor = torch.from_numpy((mask > 0).astype(np.float32)).unsqueeze(0)
+        
+        return {
+            "input": img_tensor,
+            "target": target_tensor,
+            "mask": mask_tensor,
+            "id": sample_id,
+            "weight": sample['weight'],
+        }
+
+
+def pseudo_label_finetune(config, pseudo_labels):
+    """
+    Phase 2: Fine-tune each fold model on real + pseudo-labeled data.
+    
+    Key design decisions:
+    - Lower LR (1/3 of Phase 1) to avoid catastrophic forgetting
+    - Pseudo samples weighted at 0.5x (lower confidence)
+    - Shorter training (10 epochs by default)
+    """
+    print(f"\n{'='*60}")
+    print("Phase 2: Pseudo-Label Fine-tuning")
+    print(f"{'='*60}")
+    
+    phase2_epochs = getattr(config, 'pseudo_label_epochs', 10)
+    phase2_lr = config.learning_rate * getattr(config, 'pseudo_label_lr_factor', 0.3)
+    pseudo_weight = getattr(config, 'pseudo_label_weight', 0.5)
+    
+    print(f"Phase 2 LR: {phase2_lr}")
+    print(f"Phase 2 Epochs: {phase2_epochs}")
+    print(f"Pseudo sample weight: {pseudo_weight}")
+    
+    # Load real training data
+    df = pd.read_csv(config.train_csv)
+    df = filter_excluded_samples(df)
+    
+    # Load test data info
+    test_df = pd.read_csv(config.test_csv)
+    
+    # Create augmentation
+    train_aug = None
+    if getattr(config, 'augmentation_enabled', False):
+        aug_strength = getattr(config, 'augmentation_strength', 0.6)
+        aug_mode = getattr(config, 'augmentation_mode', 'geometric')
+        train_aug = get_training_augmentation(strength=aug_strength, mode=aug_mode)
+    
+    # Stratified K-Fold setup (same as Phase 1 for consistency)
+    df = cluster_category_c(df, config.data_dir, n_clusters=3)
+    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=config.seed)
+    
+    for fold, (train_idx, val_idx) in enumerate(skf.split(df, df['difficulty'])):
+        fold_model_path = config.output_dir / f"best_model_fold{fold}.pth"
+        if not fold_model_path.exists():
+            print(f"Fold {fold}: Model not found, skipping")
+            continue
+        
+        print(f"\n{'='*40}")
+        print(f"Phase 2 - Fold {fold + 1}/5")
+        print(f"{'='*40}")
+        
+        # Load Phase 1 model
+        model = create_model(config)
+        model.load_state_dict(torch.load(fold_model_path, map_location=config.device))
+        
+        # Create combined dataset (real train + pseudo test)
+        train_df = df.loc[train_idx]
+        combined_dataset = PseudoLabelDataset(
+            real_df=train_df,
+            pseudo_df=test_df,
+            data_dir=config.data_dir,
+            image_size=config.image_size,
+            pseudo_labels=pseudo_labels,
+            pseudo_weight=pseudo_weight,
+            augmentation=train_aug,
+        )
+        
+        # Validation set stays the same (real data only)
+        val_dataset = OrganoidDataset(
+            df, config.data_dir, config.image_size, is_test=False, indices=val_idx
+        )
+        
+        train_loader = DataLoader(
+            combined_dataset, batch_size=config.batch_size,
+            shuffle=True, num_workers=config.num_workers, pin_memory=True
+        )
+        val_loader = DataLoader(
+            val_dataset, batch_size=config.batch_size,
+            shuffle=False, num_workers=config.num_workers, pin_memory=True
+        )
+        
+        criterion = create_loss(config).to(config.device)
+        optimizer = optim.AdamW(model.parameters(), lr=phase2_lr, weight_decay=config.weight_decay)
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, phase2_epochs)
+        
+        best_ssim = 0
+        
+        for epoch in range(phase2_epochs):
+            # Training with sample weighting
+            model.train()
+            epoch_loss = 0
+            n_batches = 0
+            
+            for batch in train_loader:
+                inputs = batch["input"].to(config.device)
+                targets = batch["target"].to(config.device)
+                masks = batch["mask"].to(config.device)
+                weights = batch["weight"].to(config.device)
+                
+                optimizer.zero_grad()
+                outputs = model(inputs)
+                
+                # Compute per-sample loss with mask
+                if hasattr(criterion, 'forward') and 'mask' in criterion.forward.__code__.co_varnames:
+                    loss = criterion(outputs, targets, masks)
+                else:
+                    loss = criterion(outputs, targets)
+                
+                # Weight by sample confidence (real=1.0, pseudo=0.5)
+                # This is a simplified approach - weight the total batch loss
+                batch_weight = weights.mean()
+                weighted_loss = loss * batch_weight
+                
+                weighted_loss.backward()
+                optimizer.step()
+                
+                epoch_loss += loss.item()
+                n_batches += 1
+            
+            scheduler.step()
+            
+            # Validation
+            val_results = validate(model, val_loader, criterion, config.device)
+            val_ssim = val_results['ssim']
+            
+            print(f"  Epoch {epoch+1}/{phase2_epochs} - "
+                  f"Train Loss: {epoch_loss/n_batches:.4f}, "
+                  f"Val SSIM: {val_ssim:.4f}, "
+                  f"LR: {scheduler.get_last_lr()[0]:.6f}")
+            
+            # Save best model (overwrite Phase 1)
+            if val_ssim > best_ssim:
+                best_ssim = val_ssim
+                torch.save(model.state_dict(), fold_model_path)
+                print(f"  → Saved best Phase 2 model (SSIM: {best_ssim:.4f})")
+        
+        print(f"Fold {fold+1} Phase 2 complete. Best SSIM: {best_ssim:.4f}")
+        
+        # Free memory
+        del model
+        torch.cuda.empty_cache()
+    
+    print(f"\n{'='*60}")
+    print("Phase 2 Pseudo-Label Fine-tuning Complete!")
+    print(f"{'='*60}")
+
+
+# ==============================================================================
 # Inference and Submission
 # ==============================================================================
 
@@ -2892,7 +3274,7 @@ if __name__ == "__main__":
     print(f"CV Mode: {cv_mode}")
     print(f"Run Inference: {run_inference}")
     
-    # Training
+    # Training (Phase 1)
     if cv_mode == "worst_case_v5":
         train_worst_case_cv_v5(config, n_folds=n_folds)
     elif cv_mode == "worst_case":
@@ -2902,7 +3284,18 @@ if __name__ == "__main__":
     else:
         train(config)
     
+    # exp_030: Pseudo-Labeling (Phase 2)
+    if getattr(config, 'pseudo_label_enabled', False):
+        pseudo_labels = generate_pseudo_labels(config)
+        if pseudo_labels is not None:
+            pseudo_label_finetune(config, pseudo_labels)
+            del pseudo_labels  # Free memory
+            torch.cuda.empty_cache()
+        else:
+            print("WARNING: Pseudo-label generation failed. Skipping Phase 2.")
+    
     # Inference (for LB submission)
     if run_inference:
         predict_and_submit(config)
+
 
