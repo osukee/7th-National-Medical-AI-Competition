@@ -23,9 +23,12 @@ on:
     branches:
       - 'experiment/**'
 
+concurrency:
+  group: kaggle-train-${{ github.ref }}
+  cancel-in-progress: false
+
 permissions:
   contents: write
-  pull-requests: write
 
 env:
   PYTHON_VERSION: '3.10'
@@ -194,41 +197,45 @@ jobs:
         if: steps.submit.outputs.submitted == 'true'
         run: |
           echo "Waiting for Kaggle scoring..."
-          sleep 60
+          # Build submission identity token for matching
+          COMMIT_SHORT="${GITHUB_SHA::7}"
+          BRANCH="${{ github.ref_name }}"
+          SUBMIT_TOKEN="${BRANCH} ${COMMIT_SHORT} via Actions"
+          echo "Looking for submission with description: $SUBMIT_TOKEN"
+          sleep 90
           
           SCORE="pending"
-          for i in $(seq 1 15); do
-            echo "Attempt $i/15..."
+          for i in $(seq 1 20); do
+            echo "Attempt $i/20..."
             
-            # Get latest submission
             SUBMISSIONS=$(kaggle competitions submissions \
               -c medical-ai-contest-7th-2025 --csv 2>/dev/null || echo "")
             
             if [ -n "$SUBMISSIONS" ]; then
-              # Latest submission is line 2 (after header)
-              LATEST=$(echo "$SUBMISSIONS" | head -2 | tail -1)
-              echo "Latest: $LATEST"
-              
-              # Extract publicScore (field varies, try common positions)
-              SCORE=$(echo "$LATEST" | python3 -c "
+              # Parse by header + match our submission description
+              SCORE=$(echo "$SUBMISSIONS" | python3 -c "
           import sys, csv
-          reader = csv.reader(sys.stdin)
-          row = next(reader)
-          # Find publicScore column
-          for val in row:
-              val = val.strip()
-              try:
-                  f = float(val)
-                  if 0 < f < 1:  # SSIM score range
-                      print(val)
-                      sys.exit(0)
-              except ValueError:
+          reader = csv.DictReader(sys.stdin)
+          token = '$SUBMIT_TOKEN'
+          for row in reader:
+              desc = row.get('description', row.get('Description', ''))
+              if token and token not in desc:
                   continue
+              score = row.get('publicScore', row.get('score', ''))
+              if score and score != 'None':
+                  try:
+                      float(score)
+                      print(score)
+                      sys.exit(0)
+                  except ValueError:
+                      pass
+          # Fallback: first row with valid score
+          sys.stdin.seek(0) if hasattr(sys.stdin, 'seek') else None
           print('pending')
-          " 2>/dev/null || echo "pending")
+          " 2>/dev/null <<< "$SUBMISSIONS" || echo "pending")
               
               if [ "$SCORE" != "pending" ] && [ "$SCORE" != "None" ] && [ -n "$SCORE" ]; then
-                echo "🏆 Public Score: $SCORE"
+                echo "LB Score: $SCORE"
                 echo "score=$SCORE" >> $GITHUB_OUTPUT
                 break
               fi
@@ -239,7 +246,7 @@ jobs:
           done
           
           if [ "$SCORE" = "pending" ]; then
-            echo "⚠️ Could not retrieve score after 15 attempts"
+            echo "Could not retrieve score after 20 attempts"
             echo "score=pending" >> $GITHUB_OUTPUT
           fi
 
@@ -287,12 +294,18 @@ jobs:
           ITERATION=$(python -c "import json; print(json.load(open('experiments/auto_iterations.json'))['iteration'])")
           IMPROVEMENT=$(python -c "import json; h=json.load(open('experiments/auto_iterations.json'))['history']; print(h[-1].get('improvement','unknown') if h else 'unknown')")
           
+          # Exclude kernel-metadata.json (may contain sed-modified username)
+          git checkout -- kaggle/kernel-metadata.json 2>/dev/null || true
+          
           git add -A
           git diff --staged --quiet && echo "No changes to commit" && exit 0
           
           git commit -m "auto[$ITERATION]: $IMPROVEMENT (prev score: $SCORE)"
+          
+          # Rebase before push to handle any concurrent commits
+          git pull --rebase origin ${{ github.ref_name }} || true
           git push
-          echo "✅ Pushed! Next training cycle will trigger automatically."
+          echo "Pushed! Next training cycle will trigger automatically."
 
       - name: Post summary
         if: always()

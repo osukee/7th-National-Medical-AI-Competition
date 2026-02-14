@@ -26,7 +26,6 @@ STATE_FILE = Path("experiments/auto_iterations.json")
 CONFIG_FILE = Path("kaggle/train_notebook.py")
 
 # Ordered list of improvements to try, one per iteration
-# Each item: (name, description, config_changes)
 IMPROVEMENT_QUEUE = [
     {
         "name": "dihedral8_tta",
@@ -83,10 +82,13 @@ KNOWN_GOOD_CONFIG = {
 
 
 def load_state():
-    """Load iteration state from JSON file."""
+    """Load iteration state from JSON file with corruption handling."""
     if STATE_FILE.exists():
-        with open(STATE_FILE) as f:
-            return json.load(f)
+        try:
+            with open(STATE_FILE) as f:
+                return json.load(f)
+        except (json.JSONDecodeError, KeyError) as e:
+            print(f"WARNING: Corrupt state file, resetting: {e}")
     return {
         "iteration": 0,
         "max_iterations": 5,
@@ -105,23 +107,60 @@ def save_state(state):
         json.dump(state, f, indent=2)
 
 
+def _find_config_class_range(content):
+    """Find the line range of 'class Config:' block.
+
+    Returns (start_idx, end_idx) as 0-based line indices (inclusive).
+    The end is the last line before the next top-level class/function/block.
+    """
+    lines = content.split("\n")
+    start = None
+    end = None
+    for i, line in enumerate(lines):
+        if re.match(r"^class Config\b", line):
+            start = i
+            continue
+        if start is not None and i > start:
+            # Next top-level definition ends Config block
+            if re.match(r"^(class |def |if |# ---)", line):
+                end = i - 1
+                break
+    if start is not None and end is None:
+        end = len(lines) - 1
+    return start, end
+
+
 def update_config(config_path, changes):
-    """Update Config class attributes in train_notebook.py."""
+    """Update Config class attributes in train_notebook.py.
+
+    SCOPED: Only replaces within the Config class block to avoid
+    accidentally mutating function-level variables with same names.
+    """
     content = config_path.read_text(encoding="utf-8")
+    lines = content.split("\n")
+
+    start, end = _find_config_class_range(content)
+    if start is None:
+        print("  ERROR: Could not find 'class Config' block!")
+        return
+
+    print(f"  Config class found at lines {start+1}-{end+1}")
 
     for key, value in changes.items():
-        # Match pattern: key = <old_value>  # comment
-        # Replace with: key = <new_value>  # auto-improved
-        pattern = rf"(    {key}\s*=\s*)([^\n#]+)(#[^\n]*)?"
-        replacement = rf"\g<1>{value}  # auto-improved"
-        new_content = re.sub(pattern, replacement, content)
-        if new_content != content:
-            content = new_content
-            print(f"  Updated: {key} = {value}")
-        else:
-            print(f"  Warning: Could not find '{key}' in Config")
+        found = False
+        for i in range(start, end + 1):
+            # Match: "    key = old_value  # optional comment"
+            pattern = rf"^(    {key}\s*=\s*)([^\n#]+)(#.*)?$"
+            match = re.match(pattern, lines[i])
+            if match:
+                lines[i] = f"    {key} = {value}  # auto-improved"
+                print(f"  Updated L{i+1}: {key} = {value}")
+                found = True
+                break
+        if not found:
+            print(f"  Warning: '{key}' not found in Config block")
 
-    config_path.write_text(content, encoding="utf-8")
+    config_path.write_text("\n".join(lines), encoding="utf-8")
 
 
 def decide_improvement(state, current_score):
@@ -133,7 +172,6 @@ def decide_improvement(state, current_score):
     if best_score > 0 and current_score < best_score - 0.005:
         print(f"!! Score dropped ({current_score} < {best_score} - 0.005)")
         print("Reverting to known-good config")
-        # Skip the improvement that caused the drop
         state["next_improvement_idx"] = idx + 1
         return "revert_known_good", "Revert to known-good config (score dropped)", KNOWN_GOOD_CONFIG
 
@@ -154,8 +192,9 @@ def check_stop_conditions(state, current_score):
     if current_score >= state["target_score"]:
         reasons.append(f"Target score {state['target_score']} reached! ({current_score})")
 
-    if state["iteration"] >= state["max_iterations"]:
-        reasons.append(f"Max iterations ({state['max_iterations']}) reached")
+    # Off-by-one fix: use > instead of >= so iteration 5 can still apply
+    if state["iteration"] > state["max_iterations"]:
+        reasons.append(f"Max iterations ({state['max_iterations']}) exceeded")
 
     if state["consecutive_no_improvement"] >= 2:
         reasons.append("No improvement for 2 consecutive runs")
@@ -206,9 +245,8 @@ def main():
     # Check stop conditions
     stop_reasons = check_stop_conditions(state, current_score)
     if stop_reasons:
-        print(f"\nSTOP: STOPPING: {'; '.join(stop_reasons)}")
+        print(f"\nSTOPPING: {'; '.join(stop_reasons)}")
         save_state(state)
-        # Write stop signal for workflow
         print("STOP")
         sys.exit(0)
 
@@ -216,7 +254,7 @@ def main():
     name, description, changes = decide_improvement(state, current_score)
 
     if name is None:
-        print("\nSTOP: No more improvements to try")
+        print("\nNo more improvements to try")
         save_state(state)
         print("STOP")
         sys.exit(0)
@@ -245,7 +283,7 @@ def main():
 {json.dumps(changes, indent=2)}
 """
         (exp_dir / "experiment_log.md").write_text(log, encoding="utf-8")
-        print(f"\nOK Changes applied. Ready to commit and push.")
+        print(f"\nChanges applied. Ready to commit and push.")
         print("CONTINUE")
     else:
         print("\n[DRY RUN] No files modified")
