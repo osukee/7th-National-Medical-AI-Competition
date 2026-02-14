@@ -313,10 +313,8 @@ jobs:
           ITERATION=$(python -c "import json; print(json.load(open('experiments/auto_iterations.json'))['iteration'])")
           IMPROVEMENT=$(python -c "import json; h=json.load(open('experiments/auto_iterations.json'))['history']; print(h[-1].get('improvement','unknown') if h else 'unknown')")
           
-          # Exclude kernel-metadata.json (may contain sed-modified username)
-          git checkout -- kaggle/kernel-metadata.json 2>/dev/null || true
-          
-          git add -A
+          # Only add files that auto_improve.py modifies (avoid .github/workflows which needs workflow PAT scope)
+          git add kaggle/train_notebook.py experiments/ 2>/dev/null || true
           git diff --staged --quiet && echo "No changes to commit" && exit 0
           
           git commit -m "auto[$ITERATION]: $IMPROVEMENT (prev score: $SCORE)"
