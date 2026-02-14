@@ -1,9 +1,17 @@
 {
-  "iteration": 0,
+  "iteration": 1,
   "max_iterations": 5,
   "target_score": 0.47,
-  "best_score": 0.0,
-  "history": [],
+  "best_score": 0.43181,
+  "history": [
+    {
+      "iteration": 1,
+      "score": 0.43181,
+      "timestamp": "2026-02-14T20:31:37.943379",
+      "improvement": "dihedral8_tta",
+      "description": "Switch from flip4 to dihedral8 TTA (8-way augmentation)"
+    }
+  ],
   "consecutive_no_improvement": 0,
-  "next_improvement_idx": 0
+  "next_improvement_idx": 1
 }

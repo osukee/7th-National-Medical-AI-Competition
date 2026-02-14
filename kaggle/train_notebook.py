@@ -117,7 +117,7 @@ class Config:
     # exp_018: Test Time Augmentation (TTA)
     # Predict with original + horizontal flip + vertical flip + both, average results
     tta_enabled = True  # Enable TTA for inference
-    tta_mode = "flip4"  # exp_031: Codex rec - save time vs dihedral8
+    tta_mode = "dihedral8"  # auto-improved
     tta_aggregate = "median"  # "median" or "mean"
     
     # exp_022/023: Data Augmentation (training only)
