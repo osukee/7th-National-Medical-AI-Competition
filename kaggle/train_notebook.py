@@ -72,8 +72,8 @@ class Config:
     out_channels = 1
     
     # Training
-    epochs = 25  # exp_030: More epochs for better convergence
-    batch_size = 4  # exp_030: Reduced for b5 (larger encoder needs more VRAM)
+    epochs = 15  # exp_031: Codex rec - proven convergence in 6h
+    batch_size = 8  # b4 fits in 8
     learning_rate = 1e-4
     weight_decay = 1e-5
     num_workers = 2
@@ -93,12 +93,12 @@ class Config:
     # Loss function selection
     # Options: "combined", "masked", "edge_aware", "optimized", "edge_weighted"
     # exp_021: Fixed EdgeWeightedLoss with SSIM + Grad + edge-weighted L1
-    loss_type = "edge_weighted"
+    loss_type = "optimized"  # exp_031: Codex rec - edge_weighted was fragile in exp_020
     
     # Model - exp_016: Upgrade to efficientnet-b4 for better feature extraction
-    encoder = "efficientnet-b5"  # exp_030: Larger encoder for better features
+    encoder = "efficientnet-b4"  # exp_031: Codex rec - b4 is validated (0.44039), b5 unvalidated
     encoder_weights = "imagenet"
-    gradient_checkpointing = True  # exp_030: Save VRAM with b5
+    gradient_checkpointing = False  # Not needed for b4
     
     # Architecture selection
     # Options: "unet", "unetplusplus" (U-Net++)
@@ -117,7 +117,7 @@ class Config:
     # exp_018: Test Time Augmentation (TTA)
     # Predict with original + horizontal flip + vertical flip + both, average results
     tta_enabled = True  # Enable TTA for inference
-    tta_mode = "dihedral8"  # exp_030: 8-way TTA (90° rotations + flips)
+    tta_mode = "flip4"  # exp_031: Codex rec - save time vs dihedral8
     tta_aggregate = "median"  # "median" or "mean"
     
     # exp_022/023: Data Augmentation (training only)
@@ -130,8 +130,8 @@ class Config:
     # exp_025: Fold Selection Ensemble
     # Select top N folds by SSIM (reject weak folds to reduce noise)
     # rank-based weights instead of softmax (preserves differentiation)
-    n_folds_ensemble = 5              # exp_030: Use all 5 folds
-    fold_rank_weights = [1.0, 0.9, 0.8, 0.7, 0.6]  # exp_030: Gradual decay weights
+    n_folds_ensemble = 3              # exp_031: Codex rec - weak folds add noise (exp_025)
+    fold_rank_weights = [1.0, 0.7, 0.4]  # exp_031: Proven top-3 weights
     
     # Post-processing options (Phase A quick wins)
     median_filter_size = 0    # 0=disabled, 3=3x3 median (salt-pepper removal)
@@ -161,7 +161,7 @@ class Config:
     clahe_tile_size = (8, 8)
     
     # exp_030: Pseudo-Labeling
-    pseudo_label_enabled = True
+    pseudo_label_enabled = False  # exp_031: Codex rec - unvalidated, time overhead
     pseudo_label_epochs = 10       # Phase 2 fine-tuning epochs
     pseudo_label_weight = 0.5      # Loss weight for pseudo-labeled samples (vs 1.0 for real)
     pseudo_label_lr_factor = 0.3   # LR = learning_rate * factor for Phase 2
