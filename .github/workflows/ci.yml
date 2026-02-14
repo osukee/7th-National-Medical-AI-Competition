@@ -16,7 +16,7 @@ env:
 jobs:
   test:
     name: Unit Tests
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2204
     
     steps:
       - name: Checkout code
@@ -52,7 +52,7 @@ jobs:
 
   train:
     name: Baseline Training
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2204
     needs: test
     
     steps:
@@ -121,7 +121,7 @@ jobs:
 
   decision:
     name: Improvement Decision
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2204
     needs: train
     if: github.event_name == 'pull_request'
     
