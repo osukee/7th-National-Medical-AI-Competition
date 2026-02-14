@@ -6,7 +6,7 @@ on:
       epochs:
         description: 'Number of training epochs'
         required: false
-        default: '3'  # Reduced for baseline (increase after validation)
+        default: '3'
       batch_size:
         description: 'Batch size'
         required: false
@@ -23,6 +23,10 @@ on:
     branches:
       - 'experiment/**'
 
+permissions:
+  contents: write
+  pull-requests: write
+
 env:
   PYTHON_VERSION: '3.10'
 
@@ -34,6 +38,9 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.PAT || secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -237,6 +244,56 @@ jobs:
           fi
 
 
+      - name: Auto-improve config
+        id: improve
+        if: steps.score.outputs.score != 'pending' && steps.score.outputs.score != ''
+        run: |
+          echo "=== Running Auto-Improvement Engine ==="
+          SCORE="${{ steps.score.outputs.score }}"
+          
+          RESULT=$(python scripts/auto_improve.py --score "$SCORE" --config kaggle/train_notebook.py 2>&1)
+          echo "$RESULT"
+          
+          # Check if script output STOP or CONTINUE
+          if echo "$RESULT" | grep -q "STOP"; then
+            echo "action=stop" >> $GITHUB_OUTPUT
+            echo "🛑 Auto-improvement loop stopped"
+          else
+            echo "action=continue" >> $GITHUB_OUTPUT
+            echo "✅ Improvements applied, will commit and push"
+          fi
+
+      - name: Codex review (optional)
+        if: steps.improve.outputs.action == 'continue'
+        continue-on-error: true
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          if [ -n "$OPENAI_API_KEY" ]; then
+            echo "Running Codex review..."
+            npm install -g @openai/codex 2>/dev/null || true
+            npx @openai/codex review --uncommitted 2>&1 | head -100 || true
+          else
+            echo "OPENAI_API_KEY not set, skipping Codex review"
+          fi
+
+      - name: Commit and push improvements
+        if: steps.improve.outputs.action == 'continue'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          SCORE="${{ steps.score.outputs.score }}"
+          ITERATION=$(python -c "import json; print(json.load(open('experiments/auto_iterations.json'))['iteration'])")
+          IMPROVEMENT=$(python -c "import json; h=json.load(open('experiments/auto_iterations.json'))['history']; print(h[-1].get('improvement','unknown') if h else 'unknown')")
+          
+          git add -A
+          git diff --staged --quiet && echo "No changes to commit" && exit 0
+          
+          git commit -m "auto[$ITERATION]: $IMPROVEMENT (prev score: $SCORE)"
+          git push
+          echo "✅ Pushed! Next training cycle will trigger automatically."
+
       - name: Post summary
         if: always()
         run: |
@@ -245,7 +302,15 @@ jobs:
           echo "**Status**: ${{ steps.wait_kernel.outputs.status || 'pending' }}" >> $GITHUB_STEP_SUMMARY
           echo "**Submitted**: ${{ steps.submit.outputs.submitted || 'false' }}" >> $GITHUB_STEP_SUMMARY
           echo "**Public Score**: ${{ steps.score.outputs.score || 'N/A' }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Auto-Improve**: ${{ steps.improve.outputs.action || 'skipped' }}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ -f experiments/auto_iterations.json ]; then
+            echo "### Iteration History" >> $GITHUB_STEP_SUMMARY
+            echo '```json' >> $GITHUB_STEP_SUMMARY
+            cat experiments/auto_iterations.json >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          fi
           
           if [ -f output/metrics.json ]; then
             echo "### CV Metrics" >> $GITHUB_STEP_SUMMARY
@@ -253,51 +318,3 @@ jobs:
             cat output/metrics.json >> $GITHUB_STEP_SUMMARY
             echo '```' >> $GITHUB_STEP_SUMMARY
           fi
-
-      - name: Comment on PR
-        if: github.event_name == 'pull_request' && steps.wait_kernel.outputs.status == 'complete'
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const fs = require('fs');
-            let metrics = {};
-            
-            try {
-              metrics = JSON.parse(fs.readFileSync('output/metrics.json', 'utf8'));
-            } catch (e) {
-              console.log('Could not read metrics.json');
-              return;
-            }
-            
-            const score = '${{ steps.score.outputs.score || "N/A" }}';
-            
-            const body = `## 🎉 Kaggle Training Complete
-
-            **Experiment**: ${metrics.experiment_id}
-            **Training Time**: ${Math.round(metrics.training_time_seconds / 60)} minutes
-            **Public LB Score**: ${score}
-
-            ### Results
-            | Metric | Value |
-            |--------|-------|
-            | **Public LB** | ${score} |
-            | **SSIM** | ${metrics.metrics.ssim.toFixed(4)} |
-            | **PSNR** | ${metrics.metrics.psnr.toFixed(2)} dB |
-            | **SSIM Std** | ±${metrics.metrics.ssim_std.toFixed(4)} |
-            | **PSNR Std** | ±${metrics.metrics.psnr_std.toFixed(2)} dB |
-
-            ### Configuration
-            - Epochs: ${metrics.config.epochs}
-            - Batch Size: ${metrics.config.batch_size}
-            - Learning Rate: ${metrics.config.learning_rate}
-
-            ---
-            *Auto-submitted via GitHub Actions*`;
-            
-            github.rest.issues.createComment({
-              issue_number: context.issue.number,
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              body: body
-            });
-
