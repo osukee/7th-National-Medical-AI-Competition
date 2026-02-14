@@ -154,16 +154,101 @@ jobs:
           path: output/
           retention-days: 90
 
+      - name: Submit to competition
+        id: submit
+        if: steps.wait_kernel.outputs.status == 'complete'
+        run: |
+          echo "=== Checking for submission.csv ==="
+          if [ -f output/submission.csv ]; then
+            ROW_COUNT=$(wc -l < output/submission.csv)
+            echo "Found submission.csv with $ROW_COUNT rows"
+            
+            # Build submission message
+            COMMIT_SHORT="${GITHUB_SHA::7}"
+            BRANCH="${{ github.ref_name }}"
+            MSG="${BRANCH} ${COMMIT_SHORT} via Actions"
+            
+            echo "Submitting to competition: $MSG"
+            kaggle competitions submit \
+              -c medical-ai-contest-7th-2025 \
+              -f output/submission.csv \
+              -m "$MSG"
+            
+            echo "submitted=true" >> $GITHUB_OUTPUT
+            echo "✅ Submission uploaded"
+          else
+            echo "⚠️ No submission.csv found in output/"
+            ls -la output/
+            echo "submitted=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Get LB score
+        id: score
+        if: steps.submit.outputs.submitted == 'true'
+        run: |
+          echo "Waiting for Kaggle scoring..."
+          sleep 60
+          
+          SCORE="pending"
+          for i in $(seq 1 15); do
+            echo "Attempt $i/15..."
+            
+            # Get latest submission
+            SUBMISSIONS=$(kaggle competitions submissions \
+              -c medical-ai-contest-7th-2025 --csv 2>/dev/null || echo "")
+            
+            if [ -n "$SUBMISSIONS" ]; then
+              # Latest submission is line 2 (after header)
+              LATEST=$(echo "$SUBMISSIONS" | head -2 | tail -1)
+              echo "Latest: $LATEST"
+              
+              # Extract publicScore (field varies, try common positions)
+              SCORE=$(echo "$LATEST" | python3 -c "
+          import sys, csv
+          reader = csv.reader(sys.stdin)
+          row = next(reader)
+          # Find publicScore column
+          for val in row:
+              val = val.strip()
+              try:
+                  f = float(val)
+                  if 0 < f < 1:  # SSIM score range
+                      print(val)
+                      sys.exit(0)
+              except ValueError:
+                  continue
+          print('pending')
+          " 2>/dev/null || echo "pending")
+              
+              if [ "$SCORE" != "pending" ] && [ "$SCORE" != "None" ] && [ -n "$SCORE" ]; then
+                echo "🏆 Public Score: $SCORE"
+                echo "score=$SCORE" >> $GITHUB_OUTPUT
+                break
+              fi
+            fi
+            
+            echo "Score not ready yet, waiting 30s..."
+            sleep 30
+          done
+          
+          if [ "$SCORE" = "pending" ]; then
+            echo "⚠️ Could not retrieve score after 15 attempts"
+            echo "score=pending" >> $GITHUB_OUTPUT
+          fi
+
+
       - name: Post summary
         if: always()
         run: |
           echo "## 🚀 Kaggle Training Results" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "**Status**: ${{ steps.wait_kernel.outputs.status || 'pending' }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Submitted**: ${{ steps.submit.outputs.submitted || 'false' }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Public Score**: ${{ steps.score.outputs.score || 'N/A' }}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           
           if [ -f output/metrics.json ]; then
-            echo "### Metrics" >> $GITHUB_STEP_SUMMARY
+            echo "### CV Metrics" >> $GITHUB_STEP_SUMMARY
             echo '```json' >> $GITHUB_STEP_SUMMARY
             cat output/metrics.json >> $GITHUB_STEP_SUMMARY
             echo '```' >> $GITHUB_STEP_SUMMARY
@@ -184,14 +269,18 @@ jobs:
               return;
             }
             
+            const score = '${{ steps.score.outputs.score || "N/A" }}';
+            
             const body = `## 🎉 Kaggle Training Complete
 
             **Experiment**: ${metrics.experiment_id}
             **Training Time**: ${Math.round(metrics.training_time_seconds / 60)} minutes
+            **Public LB Score**: ${score}
 
             ### Results
             | Metric | Value |
             |--------|-------|
+            | **Public LB** | ${score} |
             | **SSIM** | ${metrics.metrics.ssim.toFixed(4)} |
             | **PSNR** | ${metrics.metrics.psnr.toFixed(2)} dB |
             | **SSIM Std** | ±${metrics.metrics.ssim_std.toFixed(4)} |
@@ -203,7 +292,7 @@ jobs:
             - Learning Rate: ${metrics.config.learning_rate}
 
             ---
-            *Trained on Kaggle GPU*`;
+            *Auto-submitted via GitHub Actions*`;
             
             github.rest.issues.createComment({
               issue_number: context.issue.number,
@@ -211,3 +300,4 @@ jobs:
               repo: context.repo.repo,
               body: body
             });
+
