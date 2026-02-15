@@ -73,7 +73,7 @@ class Config:
     
     # Training
     epochs = 20  # auto-improved
-    batch_size = 8  # b4 fits in 8
+    batch_size = 4  # auto-improved
     learning_rate = 1e-4
     weight_decay = 1e-5
     num_workers = 2
@@ -96,9 +96,9 @@ class Config:
     loss_type = "optimized"  # exp_031: Codex rec - edge_weighted was fragile in exp_020
     
     # Model - exp_016: Upgrade to efficientnet-b4 for better feature extraction
-    encoder = "efficientnet-b4"  # exp_031: Codex rec - b4 is validated (0.44039), b5 unvalidated
+    encoder = "efficientnet-b5"  # auto-improved
     encoder_weights = "imagenet"
-    gradient_checkpointing = False  # Not needed for b4
+    gradient_checkpointing = True  # auto-improved
     
     # Architecture selection
     # Options: "unet", "unetplusplus" (U-Net++)
