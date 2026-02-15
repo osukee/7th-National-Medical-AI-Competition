@@ -161,7 +161,7 @@ class Config:
     clahe_tile_size = (8, 8)
     
     # exp_030: Pseudo-Labeling
-    pseudo_label_enabled = False  # exp_031: Codex rec - unvalidated, time overhead
+    pseudo_label_enabled = True  # auto-improved
     pseudo_label_epochs = 10       # Phase 2 fine-tuning epochs
     pseudo_label_weight = 0.5      # Loss weight for pseudo-labeled samples (vs 1.0 for real)
     pseudo_label_lr_factor = 0.3   # LR = learning_rate * factor for Phase 2

@@ -1,8 +1,8 @@
 {
-  "iteration": 4,
+  "iteration": 5,
   "max_iterations": 5,
   "target_score": 0.47,
-  "best_score": 0.43923,
+  "best_score": 0.44049,
   "history": [
     {
       "iteration": 1,
@@ -31,8 +31,15 @@
       "timestamp": "2026-02-15T16:51:47.762703",
       "improvement": "encoder_b5_batch4",
       "description": "Upgrade encoder to EfficientNet-b5 with batch_size=4"
+    },
+    {
+      "iteration": 5,
+      "score": 0.44049,
+      "timestamp": "2026-02-15T20:30:00.949372",
+      "improvement": "pseudo_labeling",
+      "description": "Enable pseudo-labeling Phase 2"
     }
   ],
   "consecutive_no_improvement": 0,
-  "next_improvement_idx": 4
+  "next_improvement_idx": 5
 }
