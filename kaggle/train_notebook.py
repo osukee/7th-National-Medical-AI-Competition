@@ -124,7 +124,7 @@ class Config:
     # exp_022 failed because brightness/contrast broke input-target correspondence
     # exp_023: Redesigned to use geometric-only transforms
     augmentation_enabled = True  # Enable data augmentation during training
-    augmentation_strength = 0.6  # exp_030: Slightly stronger augmentation
+    augmentation_strength = 0.7  # auto-improved
     augmentation_mode = 'geometric'  # 'geometric' (safe) or 'intensity' (deprecated)
     
     # exp_025: Fold Selection Ensemble
