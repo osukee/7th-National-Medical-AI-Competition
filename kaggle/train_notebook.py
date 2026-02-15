@@ -72,7 +72,7 @@ class Config:
     out_channels = 1
     
     # Training
-    epochs = 15  # exp_031: Codex rec - proven convergence in 6h
+    epochs = 20  # auto-improved
     batch_size = 8  # b4 fits in 8
     learning_rate = 1e-4
     weight_decay = 1e-5

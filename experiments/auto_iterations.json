@@ -1,8 +1,8 @@
 {
-  "iteration": 1,
+  "iteration": 2,
   "max_iterations": 5,
   "target_score": 0.47,
-  "best_score": 0.43181,
+  "best_score": 0.43345,
   "history": [
     {
       "iteration": 1,
@@ -10,8 +10,15 @@
       "timestamp": "2026-02-14T20:31:37.943379",
       "improvement": "dihedral8_tta",
       "description": "Switch from flip4 to dihedral8 TTA (8-way augmentation)"
+    },
+    {
+      "iteration": 2,
+      "score": 0.43345,
+      "timestamp": "2026-02-15T11:09:51.982363",
+      "improvement": "epochs_20",
+      "description": "Increase epochs from 15 to 20 for better convergence"
     }
   ],
   "consecutive_no_improvement": 0,
-  "next_improvement_idx": 1
+  "next_improvement_idx": 2
 }
