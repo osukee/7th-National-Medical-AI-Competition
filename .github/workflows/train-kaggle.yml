@@ -167,6 +167,7 @@ jobs:
       - name: Submit to competition
         id: submit
         if: steps.wait_kernel.outputs.status == 'complete'
+        continue-on-error: true
         run: |
           echo "=== Checking for submission.csv ==="
           if [ -f output/submission.csv ]; then
@@ -179,22 +180,25 @@ jobs:
             MSG="${BRANCH} ${COMMIT_SHORT} via Actions"
             
             echo "Submitting to competition: $MSG"
-            kaggle competitions submit \
+            if kaggle competitions submit \
               -c medical-ai-contest-7th-2025 \
               -f output/submission.csv \
-              -m "$MSG"
-            
-            echo "submitted=true" >> $GITHUB_OUTPUT
-            echo "✅ Submission uploaded"
+              -m "$MSG" 2>&1; then
+              echo "submitted=true" >> $GITHUB_OUTPUT
+              echo "Submission uploaded"
+            else
+              echo "WARNING: kaggle submit failed (rate limit or transient error)"
+              echo "submitted=fallback" >> $GITHUB_OUTPUT
+            fi
           else
-            echo "⚠️ No submission.csv found in output/"
-            ls -la output/
+            echo "No submission.csv found in output/"
+            ls -la output/ || true
             echo "submitted=false" >> $GITHUB_OUTPUT
           fi
 
       - name: Get LB score
         id: score
-        if: steps.submit.outputs.submitted == 'true'
+        if: steps.submit.outputs.submitted == 'true' || steps.submit.outputs.submitted == 'fallback'
         run: |
           echo "Waiting for Kaggle scoring..."
           # Build submission identity token for matching
