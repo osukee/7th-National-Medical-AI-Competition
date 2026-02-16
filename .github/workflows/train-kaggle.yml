@@ -142,7 +142,7 @@ jobs:
           exit 1
 
       - name: Download kernel output
-        if: steps.wait_kernel.outputs.status == 'complete'
+        if: always()
         run: |
           KERNEL_ID="${{ steps.push_kernel.outputs.kernel_id }}"
           mkdir -p output
@@ -157,7 +157,7 @@ jobs:
           fi
 
       - name: Upload metrics artifact
-        if: steps.wait_kernel.outputs.status == 'complete'
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: kaggle-training-results

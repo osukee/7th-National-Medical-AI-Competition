@@ -87,7 +87,7 @@ KNOWN_GOOD_CONFIG = {
     "tta_mode": '"dihedral8"',
     "n_folds_ensemble": "3",
     "fold_rank_weights": "[1.0, 0.7, 0.4]",
-    "pseudo_label_enabled": "True",
+    "pseudo_label_enabled": "False",
     "gradient_checkpointing": "True",
     "augmentation_strength": "0.7",
     "image_size": "512",
