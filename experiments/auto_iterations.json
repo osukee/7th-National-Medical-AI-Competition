@@ -1,45 +1,17 @@
 {
-  "iteration": 5,
+  "iteration": 1,
   "max_iterations": 5,
   "target_score": 0.47,
   "best_score": 0.44049,
   "history": [
     {
       "iteration": 1,
-      "score": 0.43181,
-      "timestamp": "2026-02-14T20:31:37.943379",
-      "improvement": "dihedral8_tta",
-      "description": "Switch from flip4 to dihedral8 TTA (8-way augmentation)"
-    },
-    {
-      "iteration": 2,
-      "score": 0.43345,
-      "timestamp": "2026-02-15T11:09:51.982363",
-      "improvement": "epochs_20",
-      "description": "Increase epochs from 15 to 20 for better convergence"
-    },
-    {
-      "iteration": 3,
-      "score": 0.43776,
-      "timestamp": "2026-02-15T13:59:44.189166",
-      "improvement": "augmentation_07",
-      "description": "Increase augmentation strength from 0.6 to 0.7"
-    },
-    {
-      "iteration": 4,
-      "score": 0.43923,
-      "timestamp": "2026-02-15T16:51:47.762703",
-      "improvement": "encoder_b5_batch4",
-      "description": "Upgrade encoder to EfficientNet-b5 with batch_size=4"
-    },
-    {
-      "iteration": 5,
       "score": 0.44049,
-      "timestamp": "2026-02-15T20:30:00.949372",
-      "improvement": "pseudo_labeling",
-      "description": "Enable pseudo-labeling Phase 2"
+      "timestamp": "2026-02-16T15:57:03.319345",
+      "improvement": "resolution_576",
+      "description": "Increase resolution to 576 for better SSIM structure detail"
     }
   ],
-  "consecutive_no_improvement": 0,
-  "next_improvement_idx": 5
+  "consecutive_no_improvement": 1,
+  "next_improvement_idx": 1
 }

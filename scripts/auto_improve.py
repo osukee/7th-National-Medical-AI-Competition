@@ -28,56 +28,70 @@ CONFIG_FILE = Path("kaggle/train_notebook.py")
 # Ordered list of improvements to try, one per iteration
 IMPROVEMENT_QUEUE = [
     {
-        "name": "dihedral8_tta",
-        "description": "Switch from flip4 to dihedral8 TTA (8-way augmentation)",
+        "name": "resolution_576",
+        "description": "Increase resolution to 576 for better SSIM structure detail",
         "changes": {
-            "tta_mode": '"dihedral8"',
-        },
-    },
-    {
-        "name": "epochs_20",
-        "description": "Increase epochs from 15 to 20 for better convergence",
-        "changes": {
-            "epochs": "20",
-        },
-    },
-    {
-        "name": "augmentation_07",
-        "description": "Increase augmentation strength from 0.6 to 0.7",
-        "changes": {
-            "augmentation_strength": "0.7",
-        },
-    },
-    {
-        "name": "encoder_b5_batch4",
-        "description": "Upgrade encoder to EfficientNet-b5 with batch_size=4",
-        "changes": {
-            "encoder": '"efficientnet-b5"',
-            "batch_size": "4",
+            "image_size": "576",
+            "batch_size": "2",
+            "learning_rate": "8e-5",
             "gradient_checkpointing": "True",
         },
     },
     {
-        "name": "pseudo_labeling",
-        "description": "Enable pseudo-labeling Phase 2",
+        "name": "encoder_b6_scse",
+        "description": "Upgrade to EfficientNet-b6 with scSE decoder attention",
         "changes": {
-            "pseudo_label_enabled": "True",
+            "encoder": '"efficientnet-b6"',
+            "decoder_attention_type": '"scse"',
+            "batch_size": "2",
+            "learning_rate": "7e-5",
+        },
+    },
+    {
+        "name": "cosine_24ep",
+        "description": "Extend to 24 epochs with lower LR and weight decay for convergence",
+        "changes": {
+            "epochs": "24",
+            "learning_rate": "7e-5",
+            "weight_decay": "5e-6",
+        },
+    },
+    {
+        "name": "pseudo_label_strengthen",
+        "description": "Strengthen pseudo-labeling with more epochs and higher weight",
+        "changes": {
+            "pseudo_label_epochs": "15",
+            "pseudo_label_weight": "0.7",
+            "pseudo_label_lr_factor": "0.2",
+            "tta_aggregate": '"mean"',
+        },
+    },
+    {
+        "name": "inference_tune",
+        "description": "Inference tuning: top-2 fold ensemble + CLAHE preprocessing",
+        "changes": {
+            "n_folds_ensemble": "2",
+            "fold_rank_weights": "[1.0, 0.8]",
+            "tta_aggregate": '"mean"',
+            "clahe_clip_limit": "3.0",
         },
     },
 ]
 
-# If score drops, revert to known-good config
+# Known-good config from Phase 1 final state (score 0.44049)
 KNOWN_GOOD_CONFIG = {
-    "encoder": '"efficientnet-b4"',
-    "batch_size": "8",
-    "epochs": "15",
+    "encoder": '"efficientnet-b5"',
+    "batch_size": "4",
+    "epochs": "20",
     "loss_type": '"optimized"',
-    "tta_mode": '"flip4"',
+    "tta_mode": '"dihedral8"',
     "n_folds_ensemble": "3",
     "fold_rank_weights": "[1.0, 0.7, 0.4]",
-    "pseudo_label_enabled": "False",
-    "gradient_checkpointing": "False",
-    "augmentation_strength": "0.6",
+    "pseudo_label_enabled": "True",
+    "gradient_checkpointing": "True",
+    "augmentation_strength": "0.7",
+    "image_size": "512",
+    "decoder_attention_type": "None",
 }
 
 

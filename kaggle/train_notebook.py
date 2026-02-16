@@ -104,6 +104,7 @@ class Config:
     # Options: "unet", "unetplusplus" (U-Net++)
     # exp_019: Test U-Net++ for better multi-scale feature fusion
     architecture = "unetplusplus"
+    decoder_attention_type = None  # Options: None, "scse"
     
     # exp_013: Distribution analysis settings
     analyze_distribution = True  # Enable distribution analysis on validation
