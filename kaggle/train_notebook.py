@@ -53,6 +53,7 @@ from PIL import Image
 from skimage.metrics import structural_similarity as ssim
 from skimage.metrics import peak_signal_noise_ratio as psnr
 from sklearn.model_selection import StratifiedKFold
+from torch.optim.swa_utils import AveragedModel, SWALR, update_bn
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 
@@ -104,6 +105,13 @@ class Config:
     # Options: "unet", "unetplusplus" (U-Net++)
     # exp_019: Test U-Net++ for better multi-scale feature fusion
     architecture = "unetplusplus"
+    decoder_attention_type = "scse"  # Spatial + Channel SE attention
+    
+    # SWA (Stochastic Weight Averaging)
+    swa_enabled = True
+    swa_start_ratio = 0.7   # Start SWA at 70% of training
+    swa_lr = 5e-5           # SWA learning rate
+    swa_anneal_epochs = 3   # Anneal epochs for SWALR
     
     # exp_013: Distribution analysis settings
     analyze_distribution = True  # Enable distribution analysis on validation
@@ -1599,8 +1607,10 @@ def train_epoch_weighted(model, loader, criterion, optimizer, device):
                 sample_loss = criterion(outputs[i:i+1], targets[i:i+1])
             sample_losses.append(sample_loss * weights[i])
         
-        # Weighted mean loss
-        weighted_loss = torch.stack(sample_losses).mean()
+        # Weighted mean loss (normalized by weight sum)
+        losses = torch.stack(sample_losses)
+        weights_sum = weights[:batch_size].sum()
+        weighted_loss = losses.sum() / weights_sum
         weighted_loss.backward()
         optimizer.step()
         
@@ -2023,7 +2033,13 @@ def train_kfold(config, n_folds=5):
                 # Save best model for this fold
                 torch.save(model.state_dict(), config.output_dir / f"best_model_fold{fold}.pth")
         
-        # Store fold results
+        # BUG FIX: Reload best checkpoint before evaluating fold results
+        # Previously used last-epoch model, which corrupted fold ranking
+        best_ckpt_path = config.output_dir / f"best_model_fold{fold}.pth"
+        best_state = torch.load(best_ckpt_path, map_location=config.device)
+        model.load_state_dict(best_state)
+        print(f"  Reloaded best checkpoint for fold {fold+1} evaluation")
+        
         final_metrics = validate_with_categories(model, val_loader, criterion, config.device, config)
         fold_results.append({
             'fold': fold + 1,
@@ -2051,8 +2067,9 @@ def train_kfold(config, n_folds=5):
         if final_metrics['ssim'] > best_overall_ssim:
             best_overall_ssim = final_metrics['ssim']
             best_fold = fold
-            # Save as overall best model
-            torch.save(model.state_dict(), config.output_dir / "best_model.pth")
+            # best_model.pth is already saved as best_model_fold{fold}.pth
+            import shutil
+            shutil.copy2(best_ckpt_path, config.output_dir / "best_model.pth")
     
     training_time = time.time() - start_time
     
@@ -2494,6 +2511,21 @@ def train_worst_case_cv_v5(config, n_folds=5):
         )
         scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, config.epochs)
         
+        # SWA setup
+        use_swa = getattr(config, 'swa_enabled', False)
+        swa_start = int(config.epochs * getattr(config, 'swa_start_ratio', 0.7))
+        swa_start = max(1, min(swa_start, config.epochs - 1))
+        
+        if use_swa:
+            swa_model = AveragedModel(model)
+            swa_scheduler = SWALR(
+                optimizer,
+                swa_lr=getattr(config, 'swa_lr', 5e-5),
+                anneal_strategy='cos',
+                anneal_epochs=getattr(config, 'swa_anneal_epochs', 3),
+            )
+            print(f"  SWA enabled: start at epoch {swa_start+1}, lr={config.swa_lr}")
+        
         best_fold_worst_eval = 0
         
         for epoch in range(config.epochs):
@@ -2508,18 +2540,44 @@ def train_worst_case_cv_v5(config, n_folds=5):
                 model, df, worst_eval_idx, config.data_dir, config.device, config.image_size
             )
             
-            scheduler.step()
+            # SWA: update averaged model in later epochs, use SWA scheduler
+            if use_swa and epoch >= swa_start:
+                swa_model.update_parameters(model)
+                swa_scheduler.step()
+            else:
+                scheduler.step()
             
             print(f"Train Loss (weighted): {train_loss:.4f}")
             print(f"Val SSIM: {val_metrics['ssim']:.4f}")
             print(f"🎯 Worst-Eval SSIM: {worst_eval_metrics['ssim_worst_val_mean']:.4f} "
                   f"(min: {worst_eval_metrics['ssim_worst_val_min']:.4f})")
+            if use_swa and epoch >= swa_start:
+                print(f"  [SWA active]")
             
             if worst_eval_metrics['ssim_worst_val_mean'] > best_fold_worst_eval:
                 best_fold_worst_eval = worst_eval_metrics['ssim_worst_val_mean']
                 torch.save(model.state_dict(), config.output_dir / f"best_model_fold{fold}.pth")
         
-        # Store results
+        # SWA: Update BN statistics and evaluate SWA model
+        if use_swa:
+            print(f"  Updating BN for SWA model (fold {fold+1})...")
+            update_bn(train_loader, swa_model, device=config.device)
+            swa_worst = validate_worst_val(
+                swa_model.module, df, worst_eval_idx, config.data_dir, config.device, config.image_size
+            )
+            print(f"  SWA Worst-Eval SSIM: {swa_worst['ssim_worst_val_mean']:.4f} "
+                  f"(vs best: {best_fold_worst_eval:.4f})")
+            if swa_worst['ssim_worst_val_mean'] > best_fold_worst_eval:
+                best_fold_worst_eval = swa_worst['ssim_worst_val_mean']
+                torch.save(swa_model.module.state_dict(), config.output_dir / f"best_model_fold{fold}.pth")
+                print(f"  ✓ SWA model adopted for fold {fold+1}")
+        
+        # BUG FIX: Reload best checkpoint before evaluating fold results
+        best_ckpt_path = config.output_dir / f"best_model_fold{fold}.pth"
+        best_state = torch.load(best_ckpt_path, map_location=config.device)
+        model.load_state_dict(best_state)
+        print(f"  Reloaded best checkpoint for fold {fold+1} evaluation")
+        
         final_val = validate_with_categories(model, val_loader, criterion, config.device, config)
         final_worst_eval = validate_worst_val(
             model, df, worst_eval_idx, config.data_dir, config.device, config.image_size
@@ -2544,7 +2602,8 @@ def train_worst_case_cv_v5(config, n_folds=5):
         if final_worst_eval['ssim_worst_val_mean'] > best_overall_ssim:
             best_overall_ssim = final_worst_eval['ssim_worst_val_mean']
             best_fold = fold
-            torch.save(model.state_dict(), config.output_dir / "best_model.pth")
+            import shutil
+            shutil.copy2(best_ckpt_path, config.output_dir / "best_model.pth")
     
     training_time = time.time() - start_time
     
