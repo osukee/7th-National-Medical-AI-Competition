@@ -2511,20 +2511,15 @@ def train_worst_case_cv_v5(config, n_folds=5):
         )
         scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, config.epochs)
         
-        # SWA setup
+        # SWA setup (lazy init to save VRAM - AveragedModel doubles memory)
         use_swa = getattr(config, 'swa_enabled', False)
         swa_start = int(config.epochs * getattr(config, 'swa_start_ratio', 0.7))
         swa_start = max(1, min(swa_start, config.epochs - 1))
+        swa_model = None
+        swa_scheduler = None
         
         if use_swa:
-            swa_model = AveragedModel(model)
-            swa_scheduler = SWALR(
-                optimizer,
-                swa_lr=getattr(config, 'swa_lr', 5e-5),
-                anneal_strategy='cos',
-                anneal_epochs=getattr(config, 'swa_anneal_epochs', 3),
-            )
-            print(f"  SWA enabled: start at epoch {swa_start+1}, lr={config.swa_lr}")
+            print(f"  SWA enabled: will start at epoch {swa_start+1}, lr={getattr(config, 'swa_lr', 5e-5)}")
         
         best_fold_worst_eval = 0
         
@@ -2542,6 +2537,17 @@ def train_worst_case_cv_v5(config, n_folds=5):
             
             # SWA: update averaged model in later epochs, use SWA scheduler
             if use_swa and epoch >= swa_start:
+                # Lazy init SWA model at swa_start to save VRAM
+                if swa_model is None:
+                    torch.cuda.empty_cache()
+                    swa_model = AveragedModel(model)
+                    swa_scheduler = SWALR(
+                        optimizer,
+                        swa_lr=getattr(config, 'swa_lr', 5e-5),
+                        anneal_strategy='cos',
+                        anneal_epochs=getattr(config, 'swa_anneal_epochs', 3),
+                    )
+                    print(f"  SWA model initialized at epoch {epoch+1}")
                 swa_model.update_parameters(model)
                 swa_scheduler.step()
             else:
@@ -2559,9 +2565,25 @@ def train_worst_case_cv_v5(config, n_folds=5):
                 torch.save(model.state_dict(), config.output_dir / f"best_model_fold{fold}.pth")
         
         # SWA: Update BN statistics and evaluate SWA model
-        if use_swa:
+        if use_swa and swa_model is not None:
             print(f"  Updating BN for SWA model (fold {fold+1})...")
-            update_bn(train_loader, swa_model, device=config.device)
+            # Custom update_bn for dict-based DataLoader (update_bn expects tensor inputs)
+            swa_model.train()
+            momenta = {}
+            for module in swa_model.modules():
+                if isinstance(module, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
+                    module.running_mean = torch.zeros_like(module.running_mean)
+                    module.running_var = torch.ones_like(module.running_var)
+                    momenta[module] = module.momentum
+                    module.momentum = None
+                    module.num_batches_tracked *= 0
+            if momenta:
+                with torch.no_grad():
+                    for batch in train_loader:
+                        inputs = batch["input"].to(config.device)
+                        swa_model(inputs)
+                for bn_module in momenta:
+                    bn_module.momentum = momenta[bn_module]
             swa_worst = validate_worst_val(
                 swa_model.module, df, worst_eval_idx, config.data_dir, config.device, config.image_size
             )
@@ -2571,6 +2593,11 @@ def train_worst_case_cv_v5(config, n_folds=5):
                 best_fold_worst_eval = swa_worst['ssim_worst_val_mean']
                 torch.save(swa_model.module.state_dict(), config.output_dir / f"best_model_fold{fold}.pth")
                 print(f"  ✓ SWA model adopted for fold {fold+1}")
+            # Free SWA model VRAM for next fold
+            del swa_model, swa_scheduler
+            swa_model = None
+            swa_scheduler = None
+            torch.cuda.empty_cache()
         
         # BUG FIX: Reload best checkpoint before evaluating fold results
         best_ckpt_path = config.output_dir / f"best_model_fold{fold}.pth"
