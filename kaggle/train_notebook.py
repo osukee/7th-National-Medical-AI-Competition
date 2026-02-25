@@ -105,10 +105,10 @@ class Config:
     # Options: "unet", "unetplusplus" (U-Net++)
     # exp_019: Test U-Net++ for better multi-scale feature fusion
     architecture = "unetplusplus"
-    decoder_attention_type = "scse"  # Spatial + Channel SE attention
+    decoder_attention_type = None  # exp_032: scSE hurt score, reverted
     
     # SWA (Stochastic Weight Averaging)
-    swa_enabled = True
+    swa_enabled = False  # exp_032: SWA hurt score with 20 epochs, disabled
     swa_start_ratio = 0.7   # Start SWA at 70% of training
     swa_lr = 5e-5           # SWA learning rate
     swa_anneal_epochs = 3   # Anneal epochs for SWALR
@@ -138,8 +138,8 @@ class Config:
     # exp_025: Fold Selection Ensemble
     # Select top N folds by SSIM (reject weak folds to reduce noise)
     # rank-based weights instead of softmax (preserves differentiation)
-    n_folds_ensemble = 3              # exp_031: Codex rec - weak folds add noise (exp_025)
-    fold_rank_weights = [1.0, 0.7, 0.4]  # exp_031: Proven top-3 weights
+    n_folds_ensemble = 5              # exp_033: Use all 5 folds with gradual weights
+    fold_rank_weights = [1.0, 0.85, 0.7, 0.55, 0.4]  # exp_033: 5-fold gradual weights
     
     # Post-processing options (Phase A quick wins)
     median_filter_size = 0    # 0=disabled, 3=3x3 median (salt-pepper removal)
@@ -1607,10 +1607,8 @@ def train_epoch_weighted(model, loader, criterion, optimizer, device):
                 sample_loss = criterion(outputs[i:i+1], targets[i:i+1])
             sample_losses.append(sample_loss * weights[i])
         
-        # Weighted mean loss (normalized by weight sum)
-        losses = torch.stack(sample_losses)
-        weights_sum = weights[:batch_size].sum()
-        weighted_loss = losses.sum() / weights_sum
+        # Weighted mean loss
+        weighted_loss = torch.stack(sample_losses).mean()
         weighted_loss.backward()
         optimizer.step()
         
@@ -2304,6 +2302,12 @@ def train_worst_case_cv(config, n_folds=5):
                 best_fold_worst_val = worst_val_metrics['ssim_worst_val_mean']
                 torch.save(model.state_dict(), config.output_dir / f"best_model_fold{fold}.pth")
         
+        # Reload best checkpoint before fold evaluation (align with fold ranking logic)
+        best_ckpt_path = config.output_dir / f"best_model_fold{fold}.pth"
+        best_state = torch.load(best_ckpt_path, map_location=config.device)
+        model.load_state_dict(best_state)
+        print(f"  Reloaded best checkpoint for fold {fold+1} evaluation")
+
         # Store fold results
         final_val_metrics = validate_with_categories(model, val_loader, criterion, config.device, config)
         final_worst_val = validate_worst_val(
@@ -3178,7 +3182,8 @@ def predict_and_submit(config, model_path=None):
         # Sort by SSIM descending and take top 3
         fold_data.sort(key=lambda x: x['ssim'], reverse=True)
         
-        n_select = getattr(config, 'n_folds_ensemble', 3)  # Default: top 3
+        n_select = int(getattr(config, 'n_folds_ensemble', 3))  # Default: top 3
+        n_select = max(1, min(n_select, len(fold_data)))
         selected_folds = fold_data[:n_select]
         
         print(f"\n  exp_025: Selecting top {n_select} folds (noise reduction)")
@@ -3196,7 +3201,11 @@ def predict_and_submit(config, model_path=None):
         
         # exp_025: Rank-based weights (NOT softmax)
         # Best = 1.0, Mid = 0.7, Low = 0.4 (or custom from config)
-        rank_weights = getattr(config, 'fold_rank_weights', [1.0, 0.7, 0.4])
+        rank_weights = list(getattr(config, 'fold_rank_weights', [1.0, 0.7, 0.4]))
+        if len(rank_weights) == 0:
+            rank_weights = [1.0]
+        if len(rank_weights) < len(fold_models):
+            rank_weights = rank_weights + [rank_weights[-1]] * (len(fold_models) - len(rank_weights))
         fold_weights = rank_weights[:len(fold_models)]
     else:
         print(f"  cv_results.json not found at {cv_results_path}")
@@ -3302,14 +3311,16 @@ def predict_and_submit(config, model_path=None):
                     pred_uint8 = np.clip(pred_float, 0, 255).astype(np.uint8)
                 
                 # Post-processing: Median filter (salt-pepper noise removal)
-                median_size = getattr(config, 'median_filter_size', 0)
-                if median_size > 0:
+                median_size = int(getattr(config, 'median_filter_size', 0) or 0)
+                if median_size > 1:
+                    if median_size % 2 == 0:
+                        median_size += 1
                     pred_uint8 = cv2.medianBlur(pred_uint8, median_size)
                 
                 # Post-processing: Unsharp mask (edge enhancement)
                 unsharp_strength = getattr(config, 'unsharp_strength', 0.0)
                 if unsharp_strength > 0:
-                    unsharp_radius = getattr(config, 'unsharp_radius', 1)
+                    unsharp_radius = max(1, int(getattr(config, 'unsharp_radius', 1)))
                     blur_size = 2 * unsharp_radius + 1
                     blurred = cv2.GaussianBlur(pred_uint8, (blur_size, blur_size), 0)
                     pred_float = pred_uint8.astype(np.float32)
