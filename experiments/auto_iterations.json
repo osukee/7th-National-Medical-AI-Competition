@@ -1,8 +1,8 @@
 {
-  "iteration": 1,
+  "iteration": 2,
   "max_iterations": 5,
   "target_score": 0.47,
-  "best_score": 0.44049,
+  "best_score": 0.44162,
   "history": [
     {
       "iteration": 1,
@@ -10,8 +10,15 @@
       "timestamp": "2026-02-16T15:57:03.319345",
       "improvement": "resolution_576",
       "description": "Increase resolution to 576 for better SSIM structure detail"
+    },
+    {
+      "iteration": 2,
+      "score": 0.44162,
+      "timestamp": "2026-02-25T23:47:13.313642",
+      "improvement": "encoder_b6_scse",
+      "description": "Upgrade to EfficientNet-b6 with scSE decoder attention"
     }
   ],
-  "consecutive_no_improvement": 1,
-  "next_improvement_idx": 1
+  "consecutive_no_improvement": 0,
+  "next_improvement_idx": 2
 }

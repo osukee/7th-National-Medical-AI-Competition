@@ -74,8 +74,8 @@ class Config:
     
     # Training
     epochs = 20  # auto-improved
-    batch_size = 4  # auto-improved
-    learning_rate = 1e-4
+    batch_size = 2  # auto-improved
+    learning_rate = 7e-5  # auto-improved
     weight_decay = 1e-5
     num_workers = 2
     
@@ -97,7 +97,7 @@ class Config:
     loss_type = "optimized"  # exp_031: Codex rec - edge_weighted was fragile in exp_020
     
     # Model - exp_016: Upgrade to efficientnet-b4 for better feature extraction
-    encoder = "efficientnet-b5"  # auto-improved
+    encoder = "efficientnet-b6"  # auto-improved
     encoder_weights = "imagenet"
     gradient_checkpointing = True  # auto-improved
     
@@ -105,7 +105,7 @@ class Config:
     # Options: "unet", "unetplusplus" (U-Net++)
     # exp_019: Test U-Net++ for better multi-scale feature fusion
     architecture = "unetplusplus"
-    decoder_attention_type = None  # exp_032: scSE hurt score, reverted
+    decoder_attention_type = "scse"  # auto-improved
     
     # SWA (Stochastic Weight Averaging)
     swa_enabled = False  # exp_032: SWA hurt score with 20 epochs, disabled
