@@ -73,10 +73,10 @@ class Config:
     out_channels = 1
     
     # Training
-    epochs = 20  # auto-improved
+    epochs = 24  # auto-improved
     batch_size = 2  # auto-improved
     learning_rate = 7e-5  # auto-improved
-    weight_decay = 1e-5
+    weight_decay = 5e-6  # auto-improved
     num_workers = 2
     
     # Loss weights (for EdgeAwareLoss - backward compat)

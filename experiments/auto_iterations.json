@@ -1,5 +1,5 @@
 {
-  "iteration": 2,
+  "iteration": 3,
   "max_iterations": 5,
   "target_score": 0.47,
   "best_score": 0.44162,
@@ -17,8 +17,15 @@
       "timestamp": "2026-02-25T23:47:13.313642",
       "improvement": "encoder_b6_scse",
       "description": "Upgrade to EfficientNet-b6 with scSE decoder attention"
+    },
+    {
+      "iteration": 3,
+      "score": 0.43929,
+      "timestamp": "2026-02-26T05:21:29.409638",
+      "improvement": "cosine_24ep",
+      "description": "Extend to 24 epochs with lower LR and weight decay for convergence"
     }
   ],
-  "consecutive_no_improvement": 0,
-  "next_improvement_idx": 2
+  "consecutive_no_improvement": 1,
+  "next_improvement_idx": 3
 }
